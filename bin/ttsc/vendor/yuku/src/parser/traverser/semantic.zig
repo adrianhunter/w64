@@ -1,0 +1,215 @@
+const std = @import("std");
+const ast = @import("../ast.zig");
+const wk = @import("walk.zig");
+const sc = @import("../semantic/scope.zig");
+const bi = @import("../semantic/binder.zig");
+
+const Allocator = std.mem.Allocator;
+const NodePath = wk.NodePath;
+
+pub const Scope = sc.Scope;
+pub const ScopeId = sc.ScopeId;
+pub const ScopeTree = sc.ScopeTree;
+pub const ScopeTracker = sc.ScopeTracker;
+pub const SymbolId = bi.SymbolId;
+pub const ReferenceId = bi.ReferenceId;
+pub const Symbol = bi.Symbol;
+pub const Reference = bi.Reference;
+pub const Semantic = bi.Semantic;
+pub const SymbolTracker = bi.SymbolTracker;
+
+/// Walk context combining the path stack, scope tracker, and symbol tracker.
+pub const Ctx = struct {
+    tree: *const ast.Tree,
+    path: NodePath = .{},
+    scope: ScopeTracker,
+    symbols: SymbolTracker,
+    type_position_depth: u32 = 0,
+    node_scopes: []ScopeId,
+    node_parents: []ast.NodeIndex,
+
+    pub fn init(tree: *ast.Tree) Allocator.Error!Ctx {
+        const node_scopes = try tree.allocator().alloc(ScopeId, tree.nodes.len);
+        @memset(node_scopes, .root);
+        const node_parents = try tree.allocator().alloc(ast.NodeIndex, tree.nodes.len);
+        @memset(node_parents, .null);
+        return .{
+            .tree = tree,
+            .scope = try ScopeTracker.init(tree),
+            .symbols = try SymbolTracker.init(tree),
+            .node_scopes = node_scopes,
+            .node_parents = node_parents,
+        };
+    }
+
+    /// True when the walker is currently inside a TS type-only subtree.
+    pub inline fn inTypePosition(self: *const Ctx) bool {
+        return self.type_position_depth > 0;
+    }
+
+    /// The parent of `node`, or `null` at the root.
+    pub inline fn parentOf(self: *const Ctx, node: ast.NodeIndex) ?ast.NodeIndex {
+        const parent = self.node_parents[@intFromEnum(node)];
+        return if (parent != .null) parent else null;
+    }
+
+    /// True when the walker is currently inside a TS namespace body.
+    pub inline fn inTsNamespace(self: *const Ctx) bool {
+        var it = self.scope.ancestors(self.scope.current);
+        while (it.next()) |id| {
+            if (self.scope.get(id).kind == .ts_module) return true;
+        }
+        return false;
+    }
+
+    pub inline fn enter(self: *Ctx, index: ast.NodeIndex, data: ast.NodeData) Allocator.Error!void {
+        self.path.push(index);
+        const parent = self.path.parent() orelse .null;
+        try self.scope.enter(index, parent, data);
+
+        self.node_scopes[@intFromEnum(index)] = self.scope.current;
+        self.node_parents[@intFromEnum(index)] = parent;
+
+        if (data.isTypeContext()) self.type_position_depth += 1;
+
+        try self.symbols.setBindingContext(data, parent, &self.scope);
+    }
+
+    pub inline fn post_enter(
+        self: *Ctx,
+        index: ast.NodeIndex,
+        data: ast.NodeData,
+    ) Allocator.Error!void {
+        const is_write = data == .identifier_reference and
+            isWriteTarget(self.tree, &self.path);
+        const space = switch (data) {
+            .identifier_reference, .binding_identifier => refSpace(
+                self.tree,
+                &self.path,
+                self.inTypePosition(),
+            ),
+            else => .value,
+        };
+        try self.symbols.declareBindings(index, data, &self.scope, .{
+            .is_write = is_write,
+            .space = space,
+        });
+    }
+
+    pub inline fn exit(self: *Ctx, index: ast.NodeIndex, data: ast.NodeData) void {
+        self.symbols.exit(data);
+        self.scope.exit(index, data);
+        if (data.isTypeContext()) {
+            std.debug.assert(self.type_position_depth > 0);
+            self.type_position_depth -= 1;
+        }
+        self.path.pop();
+    }
+};
+
+/// The declaration space an identifier position resolves in. The
+/// identifier is the top of `path`.
+pub fn refSpace(
+    tree: *const ast.Tree,
+    path: *const NodePath,
+    in_type_position: bool,
+) Reference.Space {
+    std.debug.assert(path.depth() > 0);
+
+    // crossing a qualified name makes this the qualifier of a dotted name
+    var qualified_left = false;
+    var child = path.ancestor(0) orelse return .value;
+    var n: usize = 1;
+    while (path.ancestor(n)) |parent| : (n += 1) {
+        switch (tree.data(parent)) {
+            .ts_qualified_name => {
+                qualified_left = true;
+                child = parent;
+                continue;
+            },
+            // `implements ns.I`
+            .member_expression => |m| if (in_type_position and m.object == child) {
+                qualified_left = true;
+                child = parent;
+                continue;
+            },
+            .call_expression => |c| if (in_type_position and c.callee == child) {
+                child = parent;
+                continue;
+            },
+            // computed keys of type members are value positions
+            //   interface I { [key]: string }
+            //   //             ^ resolves as typeof, not type
+            inline .ts_property_signature, .ts_method_signature, .binding_property => |member| {
+                if (member.computed and member.key == child) {
+                    return if (in_type_position) .typeof else .value;
+                }
+            },
+            .ts_type_query => return .typeof,
+            .export_specifier => |s| return if (s.local == child) .any else .value,
+            .export_default_declaration, .ts_export_assignment => return .any,
+            // tsc resolves an alias target as a namespace
+            .ts_import_equals_declaration => |decl| {
+                return if (decl.module_reference == child) .namespace else .any;
+            },
+            else => {},
+        }
+        if (!in_type_position) return .value;
+        return if (qualified_left) .namespace else .type;
+    }
+    return .value;
+}
+
+/// https://tc39.es/ecma262/#sec-static-semantics-assignmenttargettype
+pub fn isWriteTarget(tree: *const ast.Tree, path: *const NodePath) bool {
+    std.debug.assert(path.depth() > 0);
+
+    var child = path.ancestor(0) orelse return false;
+    var n: usize = 1;
+    while (path.ancestor(n)) |parent| : (n += 1) {
+        std.debug.assert(parent != child);
+        switch (tree.data(parent)) {
+            .assignment_expression => |a| return a.left == child,
+            .update_expression => |u| return u.argument == child,
+            // the declaration form's leaves are binding identifiers, never references
+            inline .for_in_statement, .for_of_statement => |f| return f.left == child,
+            .array_pattern, .object_pattern => child = parent,
+            // computed keys are reads
+            .binding_property => |bp| {
+                if (bp.value != child) return false;
+                child = parent;
+            },
+            // the default value is a read
+            .assignment_pattern => |ap| {
+                if (ap.left != child) return false;
+                child = parent;
+            },
+            .binding_rest_element => |r| {
+                if (r.argument != child) return false;
+                child = parent;
+            },
+            // transparent wrappers such as `(a) += 1` and `a!++`
+            .parenthesized_expression, .ts_non_null_expression => child = parent,
+            inline .ts_as_expression, .ts_satisfies_expression, .ts_type_assertion => |e| {
+                if (e.expression != child) return false;
+                child = parent;
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Walks the tree with path, scope, and symbol tracking and returns the
+/// resolved `Semantic` model.
+pub fn traverse(comptime V: type, tree: *ast.Tree, visitor: *V) Allocator.Error!Semantic {
+    std.debug.assert(tree.root != .null);
+    var ctx = try Ctx.init(tree);
+    var layer = wk.Layer(Ctx, V){ .inner = visitor };
+    try wk.walk(Ctx, wk.Layer(Ctx, V), &layer, &ctx);
+    return ctx.symbols.finalize(
+        ctx.scope.toScopeTree(),
+        ctx.node_scopes,
+        ctx.node_parents,
+    );
+}

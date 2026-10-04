@@ -1,0 +1,42 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Do not adopt a release until it has been public for 7 days, so a
+    # compromised just-published version is caught before we pull it.
+    # Security updates bypass the cooldown.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    ignore:
+      # setup-zine v2 requires Zine >= 0.12, a breaking config and frontmatter
+      # change from our pinned 0.11.3. Stay on v1 until Zine is upgraded.
+      - dependency-name: "kristoff-it/setup-zine"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      dev-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+    ignore:
+      - dependency-name: "yuku-*"
+      - dependency-name: "@yuku-*/*"
+      # TypeScript 7 is the native port, whose npm package drops the JavaScript
+      # compiler API that the tsc differential test runs against, and
+      # @typescript-eslint/typescript-estree still requires < 6.1.0. Stay on 6
+      # until both are resolved.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]

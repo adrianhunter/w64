@@ -1,0 +1,284 @@
+const std = @import("std");
+const napi_zig = @import("napi_zig");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const util_module = b.createModule(.{
+        .root_source_file = b.path("src/util/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const enable_source_maps = b.option(
+        bool,
+        "codegen-source-maps",
+        "Compile source-map support into the code generator (default true)",
+    ) orelse true;
+
+    const codegen_options = b.addOptions();
+    codegen_options.addOption(bool, "source_maps", enable_source_maps);
+    const codegen_options_module = codegen_options.createModule();
+
+    const parser_extension_source = b.option(
+        []const u8,
+        "parser-extension",
+        "Path to a Zig source file supplying parser extension points (default: none)",
+    );
+    // pins neither target nor optimize, so the host tool and wasm graphs can share the instance
+    const parser_extension = if (parser_extension_source) |source| b.createModule(.{
+        .root_source_file = if (std.fs.path.isAbsolute(source))
+            .{ .cwd_relative = source }
+        else
+            b.path(source),
+    }) else b.addOptions().createModule();
+
+    const parser_module = b.addModule("parser", .{
+        .root_source_file = b.path("src/parser/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    parser_module.addImport("util", util_module);
+    parser_module.addImport("codegen_options", codegen_options_module);
+    parser_module.addImport("parser_extension", parser_extension);
+
+    const gen_unicode_id_table = b.addExecutable(.{
+        .name = "gen-unicode-id",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_unicode_id.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_gen_unicode_id_table = b.addRunArtifact(gen_unicode_id_table);
+    const gen_unicode_id_table_step = b.step(
+        "generate-unicode-id",
+        "Generate unicode identifier tables",
+    );
+    gen_unicode_id_table_step.dependOn(&run_gen_unicode_id_table.step);
+
+    const tools_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    tools_tests.root_module.addImport("util", util_module);
+
+    const run_tools_tests = b.addRunArtifact(tools_tests);
+    // tools test needs network connection
+    const test_tools_step = b.step("test-tools", "Run the tools tests");
+    test_tools_step.dependOn(&run_tools_tests.step);
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = util_module })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = parser_module })).step);
+
+    const zig_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/parser/testing/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zig_tests_module.addImport("parser", parser_module);
+    const run_zig_tests = b.addRunArtifact(b.addTest(.{ .root_module = zig_tests_module }));
+    // corpus-driven tests read test/parser/suite relative to the repo root
+    run_zig_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_zig_tests.step);
+
+    const reference_extension = b.createModule(.{
+        .root_source_file = b.path("src/parser/testing/extension/binding.zig"),
+    });
+    const extension_parser = b.createModule(.{
+        .root_source_file = b.path("src/parser/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extension_parser.addImport("util", util_module);
+    extension_parser.addImport("codegen_options", codegen_options_module);
+    extension_parser.addImport("parser_extension", reference_extension);
+    const extension_tests = b.createModule(.{
+        .root_source_file = b.path("src/parser/testing/extension/cases.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extension_tests.addImport("parser", extension_parser);
+    extension_tests.addImport("extension", reference_extension);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = extension_tests })).step);
+
+    // host tools run fast with every assertion armed
+    const safe_util = b.createModule(.{
+        .root_source_file = b.path("src/util/root.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const safe_parser = b.createModule(.{
+        .root_source_file = b.path("src/parser/root.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    safe_parser.addImport("util", safe_util);
+    safe_parser.addImport("codegen_options", codegen_options_module);
+    safe_parser.addImport("parser_extension", parser_extension);
+    const fuzz_driver = b.createModule(.{
+        .root_source_file = b.path("src/parser/testing/fuzz/main.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    fuzz_driver.addImport("parser", safe_parser);
+    const fuzz_exe = b.addExecutable(.{ .name = "fuzz", .root_module = fuzz_driver });
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    run_fuzz.has_side_effects = true;
+    const fuzz_step = b.step("fuzz", "Fuzz the JS/TS parser for crashes and memory bugs");
+    fuzz_step.dependOn(&run_fuzz.step);
+
+    const codegen_reference_module = b.createModule(.{
+        .root_source_file = b.path("src/parser/testing/codegen/reference.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    codegen_reference_module.addImport("parser", safe_parser);
+    const codegen_reference = b.addExecutable(.{
+        .name = "codegen-reference",
+        .root_module = codegen_reference_module,
+    });
+    const codegen_reference_step = b.step(
+        "codegen-reference",
+        "Build the Zig printer reference the JS printer is checked against",
+    );
+    codegen_reference_step.dependOn(&b.addInstallArtifact(codegen_reference, .{}).step);
+
+    const napi_dep = b.dependency("napi_zig", .{});
+
+    napi_zig.addLib(b, napi_dep, .{
+        .name = "yuku-core",
+        .root = b.path("src/parser/ffi/napi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "parser", .module = parser_module },
+        },
+        .npm = .{
+            .scope = "@yuku-core",
+            .description = "Yuku's native core, the compiled code every Yuku package runs on",
+            .repository = "https://github.com/yuku-toolchain/yuku",
+        },
+    });
+
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{
+            .bulk_memory,
+            .nontrapping_fptoint,
+            .sign_ext,
+            .simd128,
+        }),
+    });
+    const wasm_step = b.step("wasm", "Build the WebAssembly core");
+
+    // ReleaseSmall saves 85 kB at the cost of 10 to 15% of the speed
+    const wasm_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+    const wasm_util = b.createModule(.{
+        .root_source_file = b.path("src/util/root.zig"),
+        .target = wasm_target,
+        .optimize = wasm_optimize,
+    });
+    const wasm_parser = b.createModule(.{
+        .root_source_file = b.path("src/parser/root.zig"),
+        .target = wasm_target,
+        .optimize = wasm_optimize,
+    });
+    wasm_parser.addImport("util", wasm_util);
+    wasm_parser.addImport("codegen_options", codegen_options_module);
+    wasm_parser.addImport("parser_extension", parser_extension);
+
+    const wasm_module = b.createModule(.{
+        .root_source_file = b.path("src/parser/ffi/wasm.zig"),
+        .target = wasm_target,
+        .optimize = wasm_optimize,
+        .strip = true,
+    });
+    wasm_module.addImport("parser", wasm_parser);
+
+    const wasm = b.addExecutable(.{ .name = "yuku-core", .root_module = wasm_module });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
+
+    const main_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    main_module.addImport("parser", parser_module);
+
+    const main_exe = b.addExecutable(.{ .name = "yuku", .root_module = main_module });
+    b.installArtifact(main_exe);
+
+    const run_cmd = b.addRunArtifact(main_exe);
+    const run_step = b.step("run", "Run the src/main.zig toolchain playground");
+    run_step.dependOn(&run_cmd.step);
+
+    const ast_transfer_module = b.createModule(.{
+        .root_source_file = b.path("src/parser/ffi/transfer/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    ast_transfer_module.addImport("parser", parser_module);
+
+    for ([_]struct {
+        step: []const u8,
+        description: []const u8,
+        root: []const u8,
+        output: []const u8,
+    }{
+        .{
+            .step = "gen-parser-decoder",
+            .description = "Generate decode.js for yuku-parser",
+            .root = "tools/gen_parser_decoder.zig",
+            .output = "decode.js",
+        },
+        .{
+            .step = "gen-analyzer-decoder",
+            .description = "Generate decode-analyzer.js for yuku-analyzer",
+            .root = "tools/gen_analyzer_decoder.zig",
+            .output = "decode-analyzer.js",
+        },
+        .{
+            .step = "gen-walk-tables",
+            .description = "Generate generated.ts for yuku-ast",
+            .root = "tools/gen_walk_tables.zig",
+            .output = "walk-tables.ts",
+        },
+        .{
+            .step = "gen-token-types",
+            .description = "Generate tokens.d.ts for @yuku-toolchain/types",
+            .root = "tools/gen_token_types.zig",
+            .output = "tokens.d.ts",
+        },
+    }) |cfg| {
+        const generator_module = b.createModule(.{
+            .root_source_file = b.path(cfg.root),
+            .target = b.graph.host,
+            .optimize = optimize,
+        });
+        generator_module.addImport("parser", parser_module);
+        generator_module.addImport("transfer", ast_transfer_module);
+
+        const generator_exe = b.addExecutable(.{
+            .name = cfg.step,
+            .root_module = generator_module,
+        });
+
+        const run_generator = b.addRunArtifact(generator_exe);
+        const generator_output = run_generator.captureStdOut(.{});
+
+        const generator_step = b.step(cfg.step, cfg.description);
+        generator_step.dependOn(&b.addInstallFile(generator_output, cfg.output).step);
+    }
+}

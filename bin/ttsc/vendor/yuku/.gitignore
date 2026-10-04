@@ -1,0 +1,25 @@
+node_modules/
+.zig-cache/
+zig-out/
+.DS_Store
+ast-reference.ts
+operator-precedence.md
+jsx-roadmap.md
+**/dist
+!playground/dist
+.astro/
+
+# Zine docs build output
+docs/public/
+
+test/**/suite
+test/projects/*/
+zig-pkg
+yuku-*.*
+.node
+typescript
+
+!playground/dist/**
+
+# Rust codegen benchmark build artifacts
+target/
