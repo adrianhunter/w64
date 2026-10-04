@@ -5,19 +5,30 @@
 <script type="module">
   const out = document.getElementById("out");
   const lines = [];
-  const log = (line) => { lines.push(line); out.textContent = lines.join("\n"); };
+  const log = (line) => {
+    lines.push(line);
+    out.textContent = lines.join("\n");
+  };
   try {
     const { runTs } = await import("/bin/ts.mjs");
     log("imported ts.mjs");
-    log("Worker ok: " + (typeof Worker));
-    const files = [{ path: "/main.ts", data: `import { Buffer } from "buffer";\nconst greeting: string = "browser ts";\nconsole.log(greeting, Buffer.from("hi").toString("hex"));\n` }];
+    const files = [
+      {
+        path: "/main.ts",
+        data: `import { Buffer } from "buffer";
+import * as path from "path";
+const greeting: string = "browser ts";
+console.log(greeting, Buffer.from("hi").toString("hex"), path.join("/a", "b", "..", "c"));
+console.log("Bun:", typeof Bun, "Deno:", typeof Deno);
+`,
+      },
+    ];
     const code = await runTs({
       wasmUrl: "/bin/ts.wasm",
       ttscUrl: "/bin/ttsc.wasm",
       entry: "/main.ts",
       files,
       onEvent: (event) => {
-        console.log("EVT " + JSON.stringify(event).slice(0, 200));
         log("event: " + JSON.stringify(event).slice(0, 200));
       },
     });

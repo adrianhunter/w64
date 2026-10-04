@@ -38,6 +38,7 @@ async function fetchBytes(url, label) {
  * @param {string[]} [options.args]
  * @param {Record<string,string>} [options.env]
  * @param {OffscreenCanvas} [options.canvas]
+ * @param {boolean|string|{file:string}} [options.opfs] back the guest SQLite VFS with a single OPFS sync-access file
  * @param {number} [options.timeoutMs]
  * @param {(event: object) => void} [options.onEvent]
  * @param {string|URL} [options.workerUrl]
@@ -51,20 +52,18 @@ export async function runTs(options) {
     args = [],
     env = {},
     canvas,
+    opfs,
     timeoutMs = 0,
     onEvent,
     workerUrl = DEFAULT_WORKER_URL,
   } = options;
 
-  console.log("[ts] fetching wasm");
   const [wasm, ttsc] = await Promise.all([
     fetchBytes(wasmUrl, "ts.wasm"),
     fetchBytes(ttscUrl, "ttsc.wasm"),
   ]);
-  console.log("[ts] fetched", wasm.byteLength, ttsc.byteLength);
 
   const worker = new Worker(workerUrl, { type: "module", name: "ts" });
-  console.log("[ts] worker created");
 
   let timer = null;
   const done = new Promise((resolve, reject) => {
@@ -95,7 +94,6 @@ export async function runTs(options) {
     }, timeoutMs);
   }
 
-  console.log("[ts] posting init");
   const mount = files.some((file) => file.path === entry);
   const mounted = mount
     ? files
@@ -105,7 +103,6 @@ export async function runTs(options) {
 
   const transfer = [];
   if (canvas) transfer.push(canvas);
-  console.log("[ts] posting init message");
   worker.postMessage(
     {
       type: "init",
@@ -116,6 +113,7 @@ export async function runTs(options) {
       env,
       files: mounted,
       canvas,
+      opfs: opfs ? { file: typeof opfs === "string" ? opfs : (opfs.file ?? "ts-vfs.sqlite") } : undefined,
     },
     transfer,
   );

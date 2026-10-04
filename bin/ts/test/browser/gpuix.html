@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>ts.wasm gpuix worker/canvas check</title>
+<canvas id="root" width="320" height="200"></canvas>
+<pre id="out">running…</pre>
+<script type="module">
+  const out = document.getElementById("out");
+  const lines = [];
+  const log = (line) => { lines.push(line); out.textContent = lines.join("\n"); };
+  try {
+    const { runGpuix } = await import("/bin/ts.mjs");
+    const files = [{ path: "/main.ts", data: `console.log("gpuix entry in worker");\n` }];
+    let sawCanvas = false;
+    const code = await runGpuix(document.getElementById("root"), {
+      wasmUrl: "/bin/ts.wasm",
+      ttscUrl: "/bin/ttsc.wasm",
+      entry: "/main.ts",
+      files,
+      onEvent: (event) => {
+        if (event.type === "canvas") sawCanvas = true;
+        log("event: " + JSON.stringify(event).slice(0, 120));
+      },
+    });
+    log("canvas transferred to worker: " + sawCanvas);
+    log("exit code: " + code);
+    log("DONE");
+  } catch (error) {
+    log("ERR " + (error && error.stack ? error.stack : error));
+  }
+</script>

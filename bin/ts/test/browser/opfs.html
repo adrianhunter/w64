@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>ts.wasm OPFS VFS check</title>
+<pre id="out">running…</pre>
+<script type="module">
+  const out = document.getElementById("out");
+  const lines = [];
+  const log = (line) => { lines.push(line); out.textContent = lines.join("\n"); };
+  try {
+    const { runTs } = await import("/bin/ts.mjs");
+    const files = [{ path: "/main.ts", data: `import { Buffer } from "buffer";\nconsole.log("opfs entry", Buffer.from("ok").toString("hex"));\n` }];
+    let vfs = null;
+    const code = await runTs({
+      wasmUrl: "/bin/ts.wasm",
+      ttscUrl: "/bin/ttsc.wasm",
+      entry: "/main.ts",
+      files,
+      opfs: { file: "ts-vfs.sqlite" },
+      onEvent: (event) => {
+        if (event.type === "vfs") vfs = event;
+        log("event: " + JSON.stringify(event).slice(0, 140));
+      },
+    });
+    log("vfs backend: " + (vfs ? vfs.backend : "none"));
+    log("exit code: " + code);
+    log("DONE");
+  } catch (error) {
+    log("ERR " + (error && error.stack ? error.stack : error));
+  }
+</script>

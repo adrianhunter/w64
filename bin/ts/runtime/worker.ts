@@ -1,19 +1,26 @@
 // Browser worker host for bin/ts.wasm.
 //
 // Runs the QuickJS guest with:
-//   - the vendored browser Node WASI implementation (vendor/node), backed by a
-//     MemoryVolume,
+//   - @bjorn3/browser_wasi_shim backed by an in-memory directory tree seeded
+//     from the message's files,
 //   - the `qjs_host` namespace (ttsc transpilation, JSPI timer waits, OPFS,
 //     externref slots),
 //   - an OffscreenCanvas handed over by the main thread, which every gpuix
 //     run receives.
 //
-// Everything the guest prints is forwarded to the main thread through
-// postMessage.
+// Guest output is forwarded to the main thread through postMessage.
 
-import { WASI, ExitStatus } from "../vendor/node/polyfills/wasi";
-import { MemoryVolume } from "../vendor/node/memory-volume";
-import { buildFileSystemBridge } from "../vendor/node/polyfills/fs";
+// The w64 WASI port adds SyncOPFSFile on top of browser_wasi_shim's API.
+import {
+  WASI,
+  WASIProcExit,
+  File,
+  Directory,
+  OpenFile,
+  ConsoleStdout,
+  PreopenDirectory,
+} from "../../../wasi.ts";
+import { OpfsStore, type OpfsHandle } from "./opfs.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -26,6 +33,7 @@ type InitMessage = {
   env?: Record<string, string>;
   files?: { path: string; data: string | ArrayBuffer }[];
   canvas?: OffscreenCanvas;
+  opfs?: { file: string };
 };
 
 const encoder = new TextEncoder();
@@ -34,8 +42,6 @@ const decoder = new TextDecoder();
 function post(message: unknown): void {
   self.postMessage(message);
 }
-
-post({ type: "loaded" });
 
 // ---------------------------------------------------------------------------
 // ttsc.wasm (bin/ttsc) used by qjs_host.transpile
@@ -72,69 +78,110 @@ async function loadTtsc(bytes: ArrayBuffer): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// in-memory directory tree for WASI
+// ---------------------------------------------------------------------------
+
+type Contents = Map<string, File | Directory>;
+
+function seedFiles(files: InitMessage["files"]): Contents {
+  const root: Contents = new Map();
+  for (const file of files ?? []) {
+    const data = typeof file.data === "string"
+      ? encoder.encode(file.data)
+      : new Uint8Array(file.data);
+    const parts = file.path.split("/").filter(Boolean);
+    let dir = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const name = parts[i];
+      const existing = dir.get(name);
+      if (existing instanceof Directory) {
+        dir = existing.contents as Contents;
+      } else {
+        const next: Contents = new Map();
+        dir.set(name, new Directory(next));
+        dir = next;
+      }
+    }
+    if (parts.length > 0) {
+      dir.set(parts[parts.length - 1], new File(data));
+    }
+  }
+  return root;
+}
+
+// ---------------------------------------------------------------------------
 // guest boot
 // ---------------------------------------------------------------------------
 
 async function boot(message: InitMessage): Promise<void> {
   if (message.canvas) {
     (globalThis as any).__tsCanvas = message.canvas;
+    post({ type: "canvas", width: message.canvas.width, height: message.canvas.height });
   }
 
-  post({ type: "progress", step: "boot" });
+  // A single OPFS file backs the guest's SQLite virtual filesystem.
+  let opfs: OpfsStore | null = null;
+  let singleHandle: OpfsHandle | null = null;
+  if (message.opfs) {
+    try {
+      opfs = await OpfsStore.open(message.opfs.file);
+      singleHandle = await opfs.get(opfs.fileName);
+      post({
+        type: "vfs",
+        backend: "opfs-sync-access-handle",
+        file: message.opfs.file,
+        size: singleHandle?.getSize() ?? 0,
+      });
+    } catch (error) {
+      post({
+        type: "vfs",
+        backend: "memory",
+        file: message.opfs.file,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   if (message.ttsc) {
     await loadTtsc(message.ttsc);
-    post({ type: "progress", step: "ttsc-loaded" });
   }
 
-  const volume = new MemoryVolume();
-  post({ type: "progress", step: "volume" });
-  const fs = buildFileSystemBridge(volume, () => "/");
-  post({ type: "progress", step: "fs-built" });
-  for (const file of message.files ?? []) {
-    const data = typeof file.data === "string"
-      ? file.data
-      : new Uint8Array(file.data);
-    const slash = file.path.lastIndexOf("/");
-    if (slash > 0) {
-      try {
-        fs.mkdirSync(file.path.slice(0, slash), { recursive: true });
-      } catch {
-        // already exists
-      }
-    }
-    fs.writeFileSync(file.path, data);
-  }
+  const stdout = ConsoleStdout.lineBuffered((line) =>
+    post({ type: "stdout", text: line + "\n" })
+  );
+  const stderr = ConsoleStdout.lineBuffered((line) =>
+    post({ type: "stderr", text: line + "\n" })
+  );
 
-  post({
-    type: "progress",
-    step: "fs-ready",
-    exists: fs.existsSync("/main.ts"),
-    size: fs.existsSync("/main.ts") ? (fs.readFileSync("/main.ts") as Uint8Array).length : -1,
-  });
-  const traced = new Proxy(fs as any, {
-    get(target, prop) {
-      const value = target[prop];
-      if (typeof value === "function") {
-        return (...args: unknown[]) => {
-          post({
-            type: "fs",
-            method: String(prop),
-            args: args.slice(0, 2).map((a) => (typeof a === "string" ? a : typeof a)),
-          });
-          return value.apply(target, args);
-        };
-      }
-      return value;
-    },
-  });
-  const wasi = new WASI({
-    version: "preview1",
-    args: ["ts", ...message.args],
-    env: message.env ?? {},
-    preopens: { "/": "/" },
-    returnOnExit: true,
-    fs: traced as any,
-  });
+  // wizer pre-initialization leaves /bundle as the runtime's only preopen,
+  // so every user file is mounted under it.
+  const bundle = (path: string): string =>
+    path.startsWith("/bundle/") || path === "/bundle"
+      ? path
+      : "/bundle/" + path.replace(/^\/+/, "");
+  const files = (message.files ?? []).map((file) => ({
+    path: bundle(file.path),
+    data: file.data,
+  }));
+
+  const wasi = new WASI(
+    ["ts", ...message.args.map(bundle)],
+    Object.entries(message.env ?? {}).map(([key, value]) => `${key}=${value}`),
+    [
+      new OpenFile(new File([])),
+      stdout,
+      stderr,
+      new PreopenDirectory(
+        "/bundle",
+        seedFiles(
+          files.map((file) => ({
+            ...file,
+            path: file.path.replace(/^\/bundle\//, ""),
+          })),
+        ),
+      ),
+    ],
+  );
 
   let instance: WebAssembly.Instance | null = null;
   const exports = (): WebAssembly.Exports => instance!.exports;
@@ -144,9 +191,7 @@ async function boot(message: InitMessage): Promise<void> {
   const readText = (ptr: number, len: number): string =>
     decoder.decode(bytes(ptr, len));
 
-  // OPFS handles are plain JS objects; they cross the boundary as externrefs
-  // so the module needs no table instructions and stays wizer-friendly.
-  const opfsHandles = new Set<any>();
+  const opfsHandles = new Map<string, Uint8Array>();
   const externrefSlots: unknown[] = [];
 
   const host: Record<string, unknown> = {
@@ -191,98 +236,82 @@ async function boot(message: InitMessage): Promise<void> {
     externref_clear: (index: number): void => {
       externrefSlots[index] = undefined;
     },
+    // The guest sees a single database file. In OPFS mode every requested
+    // path is the one SyncAccessHandle opened during boot; without OPFS the
+    // calls fall back to an in-memory buffer.
     opfs_open: (
       pathPtr: number,
       pathLen: number,
-      wantsWrite: number,
+      _wantsWrite: number,
       create: number,
       statusPtr: number,
     ): unknown => {
       const path = readText(pathPtr, pathLen);
       const status = new Int32Array(memory().buffer, statusPtr, 1);
-      try {
-        if (create !== 0 && !fs.existsSync(path)) fs.writeFileSync(path, "");
-        const handle = { path, read: 0, write: wantsWrite !== 0 };
-        opfsHandles.add(handle);
+      if (singleHandle) {
         status[0] = 0;
-        return handle;
-      } catch {
+        return { path, handle: singleHandle };
+      }
+      if (!opfsHandles.has(path) && create !== 0) {
+        opfsHandles.set(path, new Uint8Array(0));
+      }
+      if (!opfsHandles.has(path)) {
         status[0] = 1;
         return null;
       }
+      status[0] = 0;
+      return { path, memory: true };
     },
-    opfs_close: (handle: any): void => {
-      opfsHandles.delete(handle);
-    },
+    opfs_close: (): void => {},
     opfs_read: (handle: any, ptr: number, amount: bigint, offset: bigint): number => {
-      try {
-        const data = fs.readFileSync(handle.path) as Uint8Array;
-        const start = Number(offset);
-        const slice = data.subarray(start, start + Number(amount));
-        bytes(ptr, slice.length).set(slice);
-        return slice.length;
-      } catch {
-        return -1;
+      if (handle.handle) {
+        return handle.handle.read(bytes(ptr, Number(amount)), Number(offset));
       }
+      const data = opfsHandles.get(handle.path);
+      if (!data) return -1;
+      const slice = data.subarray(Number(offset), Number(offset) + Number(amount));
+      bytes(ptr, slice.length).set(slice);
+      return slice.length;
     },
     opfs_write: (handle: any, ptr: number, amount: bigint, offset: bigint): number => {
-      try {
-        const data = new Uint8Array(
-          fs.existsSync(handle.path) ? (fs.readFileSync(handle.path) as Uint8Array) : [],
-        );
-        const start = Number(offset);
-        const chunk = bytes(ptr, Number(amount));
-        const end = start + chunk.length;
-        if (end > data.length) {
-          const grown = new Uint8Array(end);
-          grown.set(data);
-          grown.set(chunk, start);
-          fs.writeFileSync(handle.path, grown);
-        } else {
-          data.set(chunk, start);
-          fs.writeFileSync(handle.path, data);
-        }
-        return chunk.length;
-      } catch {
-        return -1;
+      if (handle.handle) {
+        return handle.handle.write(bytes(ptr, Number(amount)), Number(offset));
       }
+      const data = opfsHandles.get(handle.path) ?? new Uint8Array(0);
+      const chunk = bytes(ptr, Number(amount));
+      const end = Number(offset) + chunk.length;
+      const next = new Uint8Array(Math.max(end, data.length));
+      next.set(data);
+      next.set(chunk, Number(offset));
+      opfsHandles.set(handle.path, next);
+      return chunk.length;
     },
     opfs_truncate: (handle: any, size: bigint): number => {
-      try {
-        const data = new Uint8Array(
-          fs.existsSync(handle.path) ? (fs.readFileSync(handle.path) as Uint8Array) : [],
-        );
-        const next = new Uint8Array(Number(size));
-        next.set(data.subarray(0, next.length));
-        fs.writeFileSync(handle.path, next);
+      if (handle.handle) {
+        handle.handle.truncate(Number(size));
         return 0;
-      } catch {
-        return -1;
       }
+      const data = opfsHandles.get(handle.path) ?? new Uint8Array(0);
+      const next = new Uint8Array(Number(size));
+      next.set(data.subarray(0, next.length));
+      opfsHandles.set(handle.path, next);
+      return 0;
     },
     opfs_size: (handle: any): bigint => {
-      try {
-        return BigInt((fs.readFileSync(handle.path) as Uint8Array).length);
-      } catch {
-        return -1n;
-      }
+      if (handle.handle) return BigInt(handle.handle.getSize());
+      return BigInt((opfsHandles.get(handle.path) ?? new Uint8Array(0)).length);
     },
-    opfs_sync: (): number => 0,
-    opfs_delete: (pathPtr: number, pathLen: number): number => {
-      try {
-        fs.unlinkSync(readText(pathPtr, pathLen));
+    opfs_sync: (handle: any): number => {
+      if (handle?.handle) {
+        handle.handle.flush();
         return 0;
-      } catch {
-        return -1;
       }
+      return 0;
     },
+    opfs_delete: (): number => 0,
     opfs_access: (pathPtr: number, pathLen: number): number => {
-      try {
-        fs.accessSync(readText(pathPtr, pathLen));
-        return 0;
-      } catch {
-        return -1;
-      }
+      if (singleHandle) return 0;
+      return opfsHandles.has(readText(pathPtr, pathLen)) ? 0 : -1;
     },
   };
 
@@ -290,33 +319,13 @@ async function boot(message: InitMessage): Promise<void> {
     host.timer_wait = new WebAssembly.Suspending(host.timer_wait as any);
   }
 
-  const imports: WebAssembly.Imports = {
+  const wasmInstance = await WebAssembly.instantiate(message.wasm, {
     wasi_snapshot_preview1: wasi.wasiImport,
     qjs_host: host,
-  };
-
-  post({ type: "progress", step: "instantiate" });
-  const wasmInstance = await WebAssembly.instantiate(message.wasm, imports);
+  });
   instance = wasmInstance.instance;
-  post({ type: "progress", step: "instantiated" });
-  wasi.finalizeBindings(instance as any);
+  wasi.initialize(instance as any);
 
-  // Forward guest output to the main thread instead of the worker console.
-  const forward = (kind: "stdout" | "stderr") =>
-    (...args: unknown[]) =>
-      post({ type: kind, text: args.map(String).join(" ") + "\n" });
-  const realConsole = globalThis.console;
-  (globalThis as any).console = {
-    log: forward("stdout"),
-    info: forward("stdout"),
-    debug: forward("stdout"),
-    error: forward("stderr"),
-    warn: forward("stderr"),
-    trace: forward("stderr"),
-  };
-  void realConsole;
-
-  post({ type: "progress", step: "starting" });
   try {
     let start = instance.exports._start as () => unknown;
     if (typeof WebAssembly.promising === "function") {
@@ -325,7 +334,7 @@ async function boot(message: InitMessage): Promise<void> {
     const code = await start();
     post({ type: "exit", code: typeof code === "number" ? code : 0 });
   } catch (error) {
-    if (error instanceof ExitStatus) {
+    if (error instanceof WASIProcExit) {
       post({ type: "exit", code: error.code });
       return;
     }

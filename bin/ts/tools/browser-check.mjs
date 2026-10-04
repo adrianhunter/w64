@@ -57,6 +57,13 @@ ws.onmessage = (event) => {
     else resolve(message.result);
     return;
   }
+  if (message.method === "Runtime.exceptionThrown") {
+    const details = message.params.exceptionDetails;
+    consoleLines.push(
+      "EXCEPTION " +
+        (details.exception?.description ?? details.text ?? "unknown"),
+    );
+  }
   if (message.method === "Runtime.consoleAPICalled") {
     const text = (message.params.args ?? [])
       .map((arg) => arg.value ?? arg.description ?? "")

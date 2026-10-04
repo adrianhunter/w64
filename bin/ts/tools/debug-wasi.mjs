@@ -43,17 +43,24 @@ const qjsHost = {
   opfs_truncate: () => -1, opfs_size: () => -1n, opfs_sync: () => -1,
   opfs_delete: () => -1, opfs_access: () => -1,
 };
-const bytes = readFileSync(${JSON.stringify(path.resolve(root, "..", "ts.wasm"))});
+const bytes = readFileSync(${JSON.stringify(process.env.QJS_WASM ?? path.resolve(root, "..", "ts.wasm"))});
 console.error("[debug] instantiating", bytes.length);
-for (const name of ["path_open", "fd_prestat_get", "fd_prestat_dir_name", "fd_fdstat_get", "fd_seek", "fd_read"]) {
+for (const name of Object.keys(wasi.wasiImport)) {
   const original = wasi.wasiImport[name];
-  if (typeof original === "function") {
-    wasi.wasiImport[name] = (...args) => {
-      const result = original(...args);
+  if (typeof original !== "function") continue;
+  wasi.wasiImport[name] = (...args) => {
+    let result;
+    try {
+      result = original(...args);
+    } catch (error) {
+      console.error("[wasi]", name, "THREW", error && error.message);
+      throw error;
+    }
+    if (name.startsWith("path_") || name === "fd_read" || name === "fd_seek" || name === "fd_close" || name === "fd_fdstat_get" || name === "fd_filestat_get") {
       console.error("[wasi]", name, JSON.stringify(args.map((a) => (typeof a === "bigint" ? String(a) : a))), "->", result);
-      return result;
-    };
-  }
+    }
+    return result;
+  };
 }
 try {
   const { instance } = await WebAssembly.instantiate(bytes, {

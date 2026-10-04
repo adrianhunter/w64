@@ -1002,8 +1002,8 @@ fn evalFile(
         .limited(1 << 30),
         .of(u8),
         0,
-    ) catch {
-        printStderr("qjs: cannot open file '{s}'\n", .{filename});
+    ) catch |err| {
+        printStderr("qjs: cannot open file '{s}' ({t})\n", .{ filename, err });
         return false;
     };
     defer g_gpa.free(source);

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs *.ts / *.tsx (or JS) with the pre-initialized bin/ts.wasm.
+# TypeScript is transpiled by bin/ttsc's ttsc.wasm.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node "$here/tools/run-qjs.mjs" "$here/../ts.wasm" "$@"

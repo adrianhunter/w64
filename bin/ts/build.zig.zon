@@ -9,5 +9,11 @@
         "src",
         "upstream",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        // bin/ttsc: the TypeScript/TSX transpiler (ttsc.wasm) used at runtime
+        // by qjs_host.transpile / qjs:ttsc and by the single-file build path.
+        .ttsc = .{
+            .path = "../../ttsc",
+        },
+    },
 }
