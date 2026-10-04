@@ -1,8 +1,9 @@
-// qjs prelude: a MemoryVolume-backed set of Node.js builtins built from the
-// browser Node runtime in vendor/node (bin/node). Evaluated during wizer
-// pre-initialization so modules the main bundle links against (`fs`, `path`,
-// `bun:*`, ...) resolve through globalThis.__qjs_modules without paying the
-// startup cost again.
+// Minimal node:* module registry for ts.wasm.
+//
+// Only the modules the Deno shim (and a typical gpuix example) needs are
+// imported here, so heavy polyfills (crypto, zlib, http, dgram, sqlite, ...)
+// stay out of the wasm. Everything registered here is importable later from
+// guest code under both `name` and `node:name`.
 
 import "qjs:web-globals";
 import { MemoryVolume } from "../vendor/node/memory-volume";
@@ -24,26 +25,14 @@ import * as nodeTty from "../vendor/node/polyfills/tty";
 import * as nodeDns from "../vendor/node/polyfills/dns";
 import * as nodeNet from "../vendor/node/polyfills/net";
 import * as nodeTls from "../vendor/node/polyfills/tls";
-import * as nodeHttp from "../vendor/node/polyfills/http";
-import * as nodeHttps from "../vendor/node/polyfills/https";
-import * as nodeCrypto from "../vendor/node/polyfills/crypto";
-import * as nodeModule from "../vendor/node/polyfills/module";
-import * as nodeReadline from "../vendor/node/polyfills/readline";
-import * as nodeZlib from "../vendor/node/polyfills/zlib";
-import * as nodeAsyncHooks from "../vendor/node/polyfills/async_hooks";
 import * as nodeConsole from "../vendor/node/polyfills/console";
-import * as nodeDgram from "../vendor/node/polyfills/dgram";
-import * as nodeDomain from "../vendor/node/polyfills/domain";
-import * as nodeHttp2 from "../vendor/node/polyfills/http2";
-import * as nodeInspector from "../vendor/node/polyfills/inspector";
-import * as nodeRepl from "../vendor/node/polyfills/repl";
-import * as nodeDiagnostics from "../vendor/node/polyfills/diagnostics_channel";
+import * as nodeAsyncHooks from "../vendor/node/polyfills/async_hooks";
 import * as nodePerfHooks from "../vendor/node/polyfills/perf_hooks";
 import * as nodePunycode from "../vendor/node/polyfills/punycode";
+import * as nodeModule from "../vendor/node/polyfills/module";
+import * as nodeDomain from "../vendor/node/polyfills/domain";
+import * as nodeDiagnostics from "../vendor/node/polyfills/diagnostics_channel";
 import * as nodeTraceEvents from "../vendor/node/polyfills/trace_events";
-import * as nodeV8 from "../vendor/node/polyfills/v8";
-import * as nodeVm from "../vendor/node/polyfills/vm";
-import * as nodeWasi from "../vendor/node/polyfills/wasi";
 
 const g = globalThis as unknown as Record<string, unknown>;
 
@@ -60,8 +49,6 @@ const registry = ((g.__qjs_modules as Record<string, unknown>) ??= {});
 function put(name: string, mod: unknown, extra?: Record<string, unknown>) {
   let wrapped: Record<string, unknown>;
   if (typeof mod === "function") {
-    // CommonJS-style callable modules (assert, events, ...) keep their own
-    // properties as named exports.
     wrapped = {};
     for (const key of Object.keys(mod)) {
       wrapped[key] = (mod as Record<string, unknown>)[key];
@@ -91,39 +78,26 @@ put("util/types", nodeUtil.types);
 put("querystring", nodeQs);
 put("url", nodeUrl);
 put("assert", (nodeAssert as any).default ?? nodeAssert);
-put("assert/strict", (nodeAssert as any).strict ?? (nodeAssert as any).default ?? nodeAssert);
+put("assert/strict", (nodeAssert as any).default ?? nodeAssert);
 put("string_decoder", nodeStringDecoder);
 put("stream", nodeStream);
 put("stream/promises", nodeStream.promises ?? {});
 put("constants", nodeConstants);
 put("tty", nodeTty);
 put("dns", nodeDns);
-put("net", nodeNet);
+put("net", nodeNet, { Socket: nodeNet.TcpSocket, Server: nodeNet.TcpServer });
 put("tls", nodeTls);
 put("process", proc, { default: proc });
-put("http", nodeHttp);
-put("https", nodeHttps);
-put("crypto", nodeCrypto);
-put("module", nodeModule);
-put("readline", nodeReadline);
-put("zlib", nodeZlib);
-put("async_hooks", nodeAsyncHooks);
 put("console", nodeConsole);
-put("dgram", nodeDgram);
-put("domain", nodeDomain);
-put("http2", nodeHttp2);
-put("inspector", nodeInspector);
-put("repl", nodeRepl);
-put("diagnostics_channel", nodeDiagnostics);
+put("async_hooks", nodeAsyncHooks);
 put("perf_hooks", nodePerfHooks);
 put("punycode", nodePunycode);
+put("module", nodeModule);
+put("domain", nodeDomain);
+put("diagnostics_channel", nodeDiagnostics);
 put("trace_events", nodeTraceEvents);
-put("v8", nodeV8);
-put("vm", nodeVm);
-put("wasi", nodeWasi);
 
-// worker_threads: enough surface for libraries that only probe it at import
-// time. Real workers cannot be spawned from inside the QuickJS guest.
+// enough surface for libraries that only probe these at import time
 put("worker_threads", {
   isMainThread: true,
   parentPort: null,
@@ -201,7 +175,19 @@ put("child_process", {
   ChildProcess: class ChildProcess {},
 });
 
-// stream/consumers is used by undici and node-fetch style code
+function streamText(stream: AsyncIterable<Uint8Array | string>): Promise<string> {
+  return (async () => {
+    let out = "";
+    for await (const chunk of stream) {
+      out +=
+        typeof chunk === "string"
+          ? chunk
+          : nodeBuffer.Buffer.from(chunk).toString("utf8");
+    }
+    return out;
+  })();
+}
+
 put("stream/consumers", {
   async arrayBuffer(stream: AsyncIterable<Uint8Array | string>) {
     const chunks: Uint8Array[] = [];
@@ -221,24 +207,10 @@ put("stream/consumers", {
     return out;
   },
   async text(stream: AsyncIterable<Uint8Array | string>) {
-    let out = "";
-    for await (const chunk of stream) {
-      out +=
-        typeof chunk === "string"
-          ? chunk
-          : nodeBuffer.Buffer.from(chunk).toString("utf8");
-    }
-    return out;
+    return streamText(stream);
   },
   async json(stream: AsyncIterable<Uint8Array | string>) {
-    let out = "";
-    for await (const chunk of stream) {
-      out +=
-        typeof chunk === "string"
-          ? chunk
-          : nodeBuffer.Buffer.from(chunk).toString("utf8");
-    }
-    return JSON.parse(out);
+    return JSON.parse(await streamText(stream));
   },
   async buffer(stream: AsyncIterable<Uint8Array | string>) {
     const chunks: Uint8Array[] = [];
@@ -259,7 +231,6 @@ g.__dirname = "/bundle";
 g.module = { exports: {} };
 g.exports = (g.module as { exports: unknown }).exports;
 
-// Synchronous CommonJS-style require for bundles that use dynamic requires.
 g.require = function require(name: string) {
   const modules = (g.__qjs_modules ?? {}) as Record<string, unknown>;
   let mod = modules[name] ?? modules["node:" + name];

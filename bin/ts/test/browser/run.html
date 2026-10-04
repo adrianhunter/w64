@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>ts.wasm browser smoke</title>
+<pre id="out">running…</pre>
+<script type="module">
+  const out = document.getElementById("out");
+  const lines = [];
+  const log = (line) => { lines.push(line); out.textContent = lines.join("\n"); };
+  try {
+    const { runTs } = await import("/bin/ts.mjs");
+    log("imported ts.mjs");
+    log("Worker ok: " + (typeof Worker));
+    const files = [{ path: "/main.ts", data: `import { Buffer } from "buffer";\nconst greeting: string = "browser ts";\nconsole.log(greeting, Buffer.from("hi").toString("hex"));\n` }];
+    const code = await runTs({
+      wasmUrl: "/bin/ts.wasm",
+      ttscUrl: "/bin/ttsc.wasm",
+      entry: "/main.ts",
+      files,
+      onEvent: (event) => {
+        console.log("EVT " + JSON.stringify(event).slice(0, 200));
+        log("event: " + JSON.stringify(event).slice(0, 200));
+      },
+    });
+    log("exit code: " + code);
+    log("DONE");
+  } catch (error) {
+    log("ERR " + (error && error.stack ? error.stack : error));
+  }
+</script>

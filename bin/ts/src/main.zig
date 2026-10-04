@@ -737,7 +737,20 @@ fn fileModule(
     };
     defer g_gpa.free(source);
 
-    const val = ctx.eval(source, name, .{
+    var transpiled: ?[:0]u8 = null;
+    defer if (transpiled) |t| g_gpa.free(t);
+    var effective: [:0]const u8 = source;
+    if (tsLangForPath(name)) |lang| {
+        if (!eql(lang, "js")) {
+            transpiled = transpileTsSource(g_gpa, source, lang) orelse {
+                _ = ctx.throwInternalError("ttsc failed to transpile module");
+                return null;
+            };
+            effective = transpiled.?;
+        }
+    }
+
+    const val = ctx.eval(effective, name, .{
         .type = .module,
         .compile_only = true,
     });
@@ -946,6 +959,36 @@ fn evalBuf(
     return true;
 }
 
+/// Transpiles TypeScript through the host's ttsc.wasm (bin/ttsc). Returns
+/// null for non-TypeScript input or when transpilation fails.
+fn transpileTsSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    lang: []const u8,
+) ?[:0]u8 {
+    const cap = @max(64 * 1024, source.len * 4);
+    var scratch_buf: [64 * 1024]u8 align(16) = undefined;
+    var scratch: std.heap.BufferFirstAllocator = .init(&scratch_buf, g_gpa);
+    const out = scratch.allocator().alloc(u8, cap) catch return null;
+    defer scratch.allocator().free(out);
+    @memset(out, 0);
+    const n = host.transpile(
+        source.ptr,
+        source.len,
+        lang.ptr,
+        lang.len,
+        "strip".ptr,
+        "strip".len,
+        out.ptr,
+        out.len,
+    );
+    if (n < 0) return null;
+    const len: usize = @intCast(n);
+    const buf = allocator.allocSentinel(u8, len, 0) catch return null;
+    @memcpy(buf[0..len], out[0..len]);
+    return buf;
+}
+
 fn evalFile(
     ctx: *quickjs.Context,
     filename: []const u8,
@@ -965,16 +1008,29 @@ fn evalFile(
     };
     defer g_gpa.free(source);
 
+    var transpiled: ?[:0]u8 = null;
+    defer if (transpiled) |t| g_gpa.free(t);
+    var effective: [:0]const u8 = source;
+    if (tsLangForPath(filename)) |lang| {
+        if (!eql(lang, "js")) {
+            transpiled = transpileTsSource(g_gpa, source, lang) orelse {
+                printStderr("qjs: ttsc failed for '{s}'\n", .{filename});
+                return false;
+            };
+            effective = transpiled.?;
+        }
+    }
+
     var is_module = module == 1;
     if (module < 0) {
         is_module = std.mem.endsWith(u8, filename, ".mjs") or
-            quickjs.detectModule(source);
+            quickjs.detectModule(effective);
     }
     const flags: quickjs.EvalFlags = if (is_module)
         .{ .type = .module }
     else
         .{};
-    return evalBuf(ctx, source, filename, flags, true);
+    return evalBuf(ctx, effective, filename, flags, true);
 }
 
 // =============================================================================
