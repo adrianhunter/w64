@@ -1,0 +1,948 @@
+// Buffer polyfill extending Uint8Array with Node.js Buffer API
+
+
+import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1, decodeShortAscii } from '../helpers/byte-encoding';
+
+const textEnc = new TextEncoder();
+const textDec = new TextDecoder('utf-8');
+
+// Counting a string's UTF-8 bytes needn't allocate them: encodeInto() a
+// reused buffer (servers take the byteLength of every response body)
+const LENGTH_SCRATCH_MAX = 1024 * 1024;
+let lengthScratch: Uint8Array | null = null;
+
+function utf8ByteLength(text: string): number {
+  const worst = text.length * 3;
+  if (worst > LENGTH_SCRATCH_MAX) return textEnc.encode(text).length;
+  if (!lengthScratch || lengthScratch.length < worst) {
+    lengthScratch = new Uint8Array(Math.max(worst, 16 * 1024));
+  }
+  return textEnc.encodeInto(text, lengthScratch).written;
+}
+
+function encodeUtf16Le(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length * 2);
+  for (let i = 0; i < value.length; i++) {
+    const codeUnit = value.charCodeAt(i);
+    bytes[i * 2] = codeUnit & 0xff;
+    bytes[i * 2 + 1] = codeUnit >>> 8;
+  }
+  return bytes;
+}
+
+function decodeUtf16Le(bytes: Uint8Array): string {
+  let result = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset + 1 < bytes.length; offset += chunkSize * 2) {
+    const count = Math.min(chunkSize, (bytes.length - offset) >>> 1);
+    const codeUnits = new Array<number>(count);
+    for (let i = 0; i < count; i++) {
+      codeUnits[i] = bytes[offset + i * 2] | (bytes[offset + i * 2 + 1] << 8);
+    }
+    result += String.fromCharCode(...codeUnits);
+  }
+  return result;
+}
+
+// Pre-computed hex char → nibble value lookup (0-255 for valid hex chars, 0 for invalid)
+const HEX_DECODE = new Uint8Array(128);
+for (let i = 0; i < 10; i++) HEX_DECODE[48 + i] = i;         // '0'-'9'
+for (let i = 0; i < 6; i++) { HEX_DECODE[65 + i] = 10 + i; HEX_DECODE[97 + i] = 10 + i; } // 'A'-'F', 'a'-'f'
+
+// Node's base64 decoder is lenient where atob isn't: characters outside the
+// alphabet are skipped, "-" and "_" are accepted, the first "=" ends the
+// data and a lone trailing character is dropped. Only used once the strict
+// decoder rejected the input.
+function lenientBase64(input: string): string {
+  let b64 = input
+    .split("=")[0]
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .replace(/[^A-Za-z0-9+/]/g, "");
+  const rem = b64.length % 4;
+  if (rem === 1) b64 = b64.slice(0, -1);
+  else if (rem === 2) b64 += "==";
+  else if (rem === 3) b64 += "=";
+  return b64;
+}
+
+// A Buffer over bytes that were just produced for it (an encode result):
+// wrap the same memory instead of copying it into a second allocation.
+function viewOf(bytes: Uint8Array): BufferPolyfill {
+  return new BufferPolyfill(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+}
+
+const nativeIndexOf = Uint8Array.prototype.indexOf;
+
+const KNOWN_ENCODINGS = new Set([
+  'utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'base64', 'base64url', 'hex',
+  'utf16le', 'utf-16le', 'ucs2', 'ucs-2',
+]);
+
+// ---- The main BufferPolyfill class ----
+
+class BufferPolyfill extends Uint8Array {
+  static readonly BYTES_PER_ELEMENT = 1;
+
+  // Overloads matching Node.js Buffer.from
+  static from(
+    source: string | ArrayBuffer | SharedArrayBuffer | Uint8Array | number[] | ArrayLike<number> | Iterable<number>,
+    encOrMapper?: string | number | ((v: unknown, i: number) => number),
+    ctx?: unknown
+  ): BufferPolyfill {
+    // Handle typed-array style mapper
+    if (typeof encOrMapper === 'function') {
+      const items = Array.from(source as ArrayLike<number>, encOrMapper as (v: number, i: number) => number, ctx);
+      return new BufferPolyfill(items);
+    }
+
+    const encoding = encOrMapper as string | undefined;
+
+    if (Array.isArray(source)) {
+      return new BufferPolyfill(source);
+    }
+
+    if (typeof source === 'string') {
+      // the common case first, without normalizing the encoding name
+      if (encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') {
+        return viewOf(textEnc.encode(source));
+      }
+      const enc = (encoding || 'utf8').toLowerCase();
+
+      if (enc === 'base64' || enc === 'base64url') {
+        let b64 = source;
+        if (enc === 'base64url') {
+          b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
+          while (b64.length % 4 !== 0) b64 += '=';
+        }
+        let decoded: Uint8Array;
+        try {
+          decoded = base64ToBytes(b64);
+        } catch {
+          decoded = base64ToBytes(lenientBase64(b64));
+        }
+        return viewOf(decoded);
+      }
+
+      if (enc === 'hex') {
+        const octets = new Uint8Array(source.length >>> 1);
+        for (let i = 0; i < source.length; i += 2) {
+          octets[i >>> 1] = (HEX_DECODE[source.charCodeAt(i)] << 4) | HEX_DECODE[source.charCodeAt(i + 1)];
+        }
+        return viewOf(octets);
+      }
+
+      if (enc === 'latin1' || enc === 'binary' || enc === 'ascii') {
+        const octets = new Uint8Array(source.length);
+        for (let i = 0; i < source.length; i++) {
+          octets[i] = source.charCodeAt(i) & 0xff;
+        }
+        return viewOf(octets);
+      }
+
+      if (enc === 'utf16le' || enc === 'utf-16le' || enc === 'ucs2' || enc === 'ucs-2') {
+        return viewOf(encodeUtf16Le(source));
+      }
+
+      // utf-8 default
+      return viewOf(textEnc.encode(source));
+    }
+
+    if (source instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer)) {
+      // napi-rs uses Buffer.from(arrayBuffer, byteOffset, length) to view WebAssembly.Memory.buffer
+      if (typeof encOrMapper === 'number') {
+        const offset = encOrMapper;
+        const length = ctx as number | undefined;
+        return new BufferPolyfill(source as ArrayBuffer, offset, length);
+      }
+      return new BufferPolyfill(source as ArrayBuffer);
+    }
+
+    return new BufferPolyfill(source as Uint8Array);
+  }
+
+  static alloc(
+    len: number,
+    fillValue?: number | string | Uint8Array,
+    encoding?: string,
+  ): BufferPolyfill {
+    const buf = new BufferPolyfill(len);
+    if (fillValue === undefined) return buf;
+
+    if (typeof fillValue === "number") {
+      buf.fill(fillValue & 0xff);
+      return buf;
+    }
+
+    const fillBytes =
+      typeof fillValue === "string"
+        ? BufferPolyfill.from(fillValue, encoding || "utf8")
+        : fillValue instanceof Uint8Array
+          ? fillValue
+          : BufferPolyfill.from(fillValue as ArrayLike<number>);
+
+    if (fillBytes.length === 0) return buf;
+    for (let i = 0; i < len; i++) {
+      buf[i] = fillBytes[i % fillBytes.length];
+    }
+    return buf;
+  }
+
+  static allocUnsafe(len: number): BufferPolyfill {
+    return new BufferPolyfill(len);
+  }
+
+  static allocUnsafeSlow(len: number): BufferPolyfill {
+    return new BufferPolyfill(len);
+  }
+
+  static concat(
+    list: (Uint8Array | BufferPolyfill)[],
+    totalLength?: number,
+  ): BufferPolyfill {
+    let sumLen = 0;
+    for (const chunk of list) sumLen += chunk.length;
+    const targetLen = totalLength !== undefined ? totalLength : sumLen;
+    const merged = new BufferPolyfill(targetLen);
+    let pos = 0;
+    for (const chunk of list) {
+      if (pos >= targetLen) break;
+      const copyLen = Math.min(chunk.length, targetLen - pos);
+      if (copyLen === chunk.length) {
+        merged.set(chunk, pos);
+      } else {
+        merged.set(chunk.subarray(0, copyLen), pos);
+      }
+      pos += copyLen;
+    }
+    return merged;
+  }
+
+  static compare(a: Uint8Array, b: Uint8Array): number {
+    const bound = Math.min(a.length, b.length);
+    for (let i = 0; i < bound; i++) {
+      if (a[i] < b[i]) return -1;
+      if (a[i] > b[i]) return 1;
+    }
+    if (a.length < b.length) return -1;
+    if (a.length > b.length) return 1;
+    return 0;
+  }
+
+  // Real Node returns false for plain Uint8Arrays. Code branches on this to
+  // decide whether Buffer methods exist on the value (e.g. Next's
+  // indexOfUint8Array calls haystack.indexOf(needleBytes), which only does a
+  // subsequence search on a real Buffer — native Uint8Array#indexOf compares
+  // elements against the needle object and always misses).
+  static isBuffer(candidate: unknown): candidate is BufferPolyfill {
+    return candidate instanceof BufferPolyfill;
+  }
+
+  static isEncoding(enc: string): boolean {
+    return KNOWN_ENCODINGS.has(enc.toLowerCase());
+  }
+
+  static byteLength(text: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer, enc?: string): number {
+    // like node: a buffer's length is its size, whatever the encoding
+    if (typeof text !== 'string') {
+      if (
+        ArrayBuffer.isView(text) ||
+        text instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== 'undefined' && text instanceof SharedArrayBuffer)
+      ) {
+        return text.byteLength;
+      }
+      text = String(text);
+    }
+    const lower = (enc || 'utf8').toLowerCase();
+    if (lower === 'base64' || lower === 'base64url') {
+      const stripped = text.replace(/[=]/g, '');
+      return Math.floor(stripped.length * 3 / 4);
+    }
+    if (lower === 'hex') {
+      return text.length >>> 1;
+    }
+    if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
+      return text.length * 2;
+    }
+    if (lower === 'latin1' || lower === 'binary' || lower === 'ascii') {
+      return text.length;
+    }
+    return utf8ByteLength(text);
+  }
+
+  // ---- Instance methods ----
+
+  toString(enc: BufferEncoding = 'utf8', start?: number, end?: number): string {
+    const lower = enc === 'utf8' ? 'utf8' : (enc || 'utf8').toLowerCase();
+
+    // Node supports toString(encoding, start, end) — webpack's wasm-hash
+    // relies on it to read a small hex digest out of a whole-memory Buffer view
+    let view: BufferPolyfill = this;
+    if (start !== undefined || end !== undefined) {
+      const from = Math.max(0, Math.min(this.length, start ?? 0));
+      const to = Math.max(from, Math.min(this.length, end ?? this.length));
+      view = this.subarray(from, to);
+    }
+
+    if (lower === 'base64') return bytesToBase64(view);
+
+    if (lower === 'base64url') {
+      return bytesToBase64(view).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    }
+
+    if (lower === 'hex') return bytesToHex(view);
+
+    if (lower === 'latin1' || lower === 'binary' || lower === 'ascii') {
+      return bytesToLatin1(view);
+    }
+
+    if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
+      return decodeUtf16Le(view);
+    }
+
+    const short = decodeShortAscii(view);
+    if (short !== null) return short;
+
+    // copy into fresh buffer, TextDecoder.decode() rejects SharedArrayBuffer views (napi-rs/WASI over shared memory)
+    if (typeof SharedArrayBuffer !== "undefined" && view.buffer instanceof SharedArrayBuffer) {
+      const copy = new Uint8Array(view.byteLength);
+      copy.set(view);
+      return textDec.decode(copy);
+    }
+    return textDec.decode(view);
+  }
+
+  slice(begin?: number, end?: number): BufferPolyfill {
+    return this.subarray(begin, end);
+  }
+
+  subarray(begin?: number, end?: number): BufferPolyfill {
+    // %TypedArray%.prototype.subarray's index rules, but constructing the
+    // view directly: the species lookup it does for a subclass is V8's slow
+    // path, and Rollup/Vite slice buffers constantly
+    const len = this.length;
+    let from = begin === undefined ? 0 : Math.trunc(Number(begin)) || 0;
+    from = from < 0 ? Math.max(len + from, 0) : Math.min(from, len);
+    let to = end === undefined ? len : Math.trunc(Number(end)) || 0;
+    to = to < 0 ? Math.max(len + to, 0) : Math.min(to, len);
+    return new BufferPolyfill(this.buffer as ArrayBuffer, this.byteOffset + from, Math.max(to - from, 0));
+  }
+
+  write(string: string, encoding?: BufferEncoding): number;
+  write(string: string, offset: number, encoding?: BufferEncoding): number;
+  write(string: string, offset: number, length: number, encoding?: BufferEncoding): number;
+  write(string: string, offsetOrEncoding?: number | BufferEncoding, lengthOrEncoding?: number | BufferEncoding, encoding?: BufferEncoding): number {
+    const offset = typeof offsetOrEncoding === "number" ? offsetOrEncoding : 0;
+    let enc: BufferEncoding | undefined;
+    if (typeof offsetOrEncoding === "string") enc = offsetOrEncoding;
+    else if (typeof lengthOrEncoding === "string") enc = lengthOrEncoding;
+    else enc = encoding;
+    // webpack's wasm-hash writes binary strings with "latin1"; utf8-encoding
+    // those would expand chars >= 0x80 to two bytes and corrupt the hash state
+    const encoded = BufferPolyfill.from(string, enc || "utf8");
+    let len = typeof lengthOrEncoding === "number" ? Math.min(lengthOrEncoding, encoded.length) : encoded.length;
+    len = Math.min(len, this.length - offset);
+    this.set(encoded.subarray(0, len), offset);
+    return len;
+  }
+
+  copy(dest: BufferPolyfill, destStart?: number, srcStart?: number, srcEnd?: number): number {
+    const segment = this.subarray(srcStart || 0, srcEnd);
+    dest.set(segment, destStart || 0);
+    return segment.length;
+  }
+
+  compare(other: Uint8Array): number {
+    const bound = Math.min(this.length, other.length);
+    for (let i = 0; i < bound; i++) {
+      if (this[i] < other[i]) return -1;
+      if (this[i] > other[i]) return 1;
+    }
+    if (this.length < other.length) return -1;
+    if (this.length > other.length) return 1;
+    return 0;
+  }
+
+  equals(other: Uint8Array): boolean {
+    if (this.length !== other.length) return false;
+    return this.compare(other) === 0;
+  }
+
+  toJSON(): { type: string; data: number[] } {
+    return { type: 'Buffer', data: Array.from(this) };
+  }
+
+  hasOwnProperty(key: PropertyKey): boolean {
+    return Object.prototype.hasOwnProperty.call(this, key);
+  }
+
+  indexOf(needle: number | Uint8Array | string, fromIndex?: number): number {
+    const start = fromIndex || 0;
+    if (typeof needle === 'number') {
+      // (a non-numeric or fractional start never lined up with an index)
+      if (typeof start !== 'number' || start !== Math.floor(start)) return -1;
+      // native scan (memchr) from the same start the loop used
+      return nativeIndexOf.call(this, needle, start < 0 ? 0 : start);
+    }
+    const search = typeof needle === 'string' ? BufferPolyfill.from(needle) : needle;
+    const n = search.length;
+    const last = this.length - n;
+    if (n === 0) return start <= last ? start : -1;
+    if (typeof start !== 'number') return -1;
+    // jump between occurrences of the first byte natively, then compare
+    const first = search[0];
+    let i = start < 0 ? 0 : start;
+    if (i !== Math.floor(i)) {
+      // (a fractional start never lined up with an index in the old loop)
+      return -1;
+    }
+    while (i <= last) {
+      i = nativeIndexOf.call(this, first, i);
+      if (i === -1 || i > last) return -1;
+      let j = 1;
+      while (j < n && this[i + j] === search[j]) j++;
+      if (j === n) return i;
+      i++;
+    }
+    return -1;
+  }
+
+  lastIndexOf(needle: number | Uint8Array | string, fromIndex?: number): number {
+    const end =
+      fromIndex === undefined
+        ? this.length
+        : Math.min(Math.max(fromIndex, 0), this.length);
+
+    if (typeof needle === "number") {
+      const byte = needle & 0xff;
+      for (let i = end - 1; i >= 0; i--) {
+        if (this[i] === byte) return i;
+      }
+      return -1;
+    }
+
+    const search = typeof needle === "string" ? BufferPolyfill.from(needle) : needle;
+    if (search.length === 0) return end;
+    if (search.length > this.length) return -1;
+
+    const maxStart = Math.min(end, this.length - search.length);
+    for (let i = maxStart; i >= 0; i--) {
+      let match = true;
+      for (let j = 0; j < search.length; j++) {
+        if (this[i + j] !== search[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return i;
+    }
+    return -1;
+  }
+
+  includes(needle: number | Uint8Array | string, fromIndex?: number): boolean {
+    return this.indexOf(needle, fromIndex) !== -1;
+  }
+
+  // ---- Unsigned integer reads ----
+
+  readUInt8(pos: number): number {
+    return this[pos];
+  }
+
+  readUInt16BE(pos: number): number {
+    return (this[pos] << 8) | this[pos + 1];
+  }
+
+  readUInt16LE(pos: number): number {
+    return this[pos] | (this[pos + 1] << 8);
+  }
+
+  readUInt32BE(pos: number): number {
+    return ((this[pos] << 24) | (this[pos + 1] << 16) | (this[pos + 2] << 8) | this[pos + 3]) >>> 0;
+  }
+
+  readUInt32LE(pos: number): number {
+    return ((this[pos]) | (this[pos + 1] << 8) | (this[pos + 2] << 16) | (this[pos + 3] << 24)) >>> 0;
+  }
+
+  // ---- Unsigned integer writes ----
+
+  writeUInt8(val: number, pos: number): number {
+    this[pos] = val & 0xff;
+    return pos + 1;
+  }
+
+  writeUInt16BE(val: number, pos: number): number {
+    this[pos] = (val >>> 8) & 0xff;
+    this[pos + 1] = val & 0xff;
+    return pos + 2;
+  }
+
+  writeUInt16LE(val: number, pos: number): number {
+    this[pos] = val & 0xff;
+    this[pos + 1] = (val >>> 8) & 0xff;
+    return pos + 2;
+  }
+
+  writeUInt32BE(val: number, pos: number): number {
+    this[pos] = (val >>> 24) & 0xff;
+    this[pos + 1] = (val >>> 16) & 0xff;
+    this[pos + 2] = (val >>> 8) & 0xff;
+    this[pos + 3] = val & 0xff;
+    return pos + 4;
+  }
+
+  writeUInt32LE(val: number, pos: number): number {
+    this[pos] = val & 0xff;
+    this[pos + 1] = (val >>> 8) & 0xff;
+    this[pos + 2] = (val >>> 16) & 0xff;
+    this[pos + 3] = (val >>> 24) & 0xff;
+    return pos + 4;
+  }
+
+  // ---- Lowercase aliases ----
+  readUint8(pos: number): number { return this.readUInt8(pos); }
+  readUint16BE(pos: number): number { return this.readUInt16BE(pos); }
+  readUint16LE(pos: number): number { return this.readUInt16LE(pos); }
+  readUint32BE(pos: number): number { return this.readUInt32BE(pos); }
+  readUint32LE(pos: number): number { return this.readUInt32LE(pos); }
+  writeUint8(val: number, pos: number): number { return this.writeUInt8(val, pos); }
+  writeUint16BE(val: number, pos: number): number { return this.writeUInt16BE(val, pos); }
+  writeUint16LE(val: number, pos: number): number { return this.writeUInt16LE(val, pos); }
+  writeUint32BE(val: number, pos: number): number { return this.writeUInt32BE(val, pos); }
+  writeUint32LE(val: number, pos: number): number { return this.writeUInt32LE(val, pos); }
+
+  // ---- Signed integer reads ----
+
+  readInt8(pos: number): number {
+    const raw = this[pos];
+    return raw & 0x80 ? raw - 0x100 : raw;
+  }
+
+  readInt16BE(pos: number): number {
+    const raw = this.readUInt16BE(pos);
+    return raw & 0x8000 ? raw - 0x10000 : raw;
+  }
+
+  readInt16LE(pos: number): number {
+    const raw = this.readUInt16LE(pos);
+    return raw & 0x8000 ? raw - 0x10000 : raw;
+  }
+
+  readInt32BE(pos: number): number {
+    return this.readUInt32BE(pos) | 0;
+  }
+
+  readInt32LE(pos: number): number {
+    return this.readUInt32LE(pos) | 0;
+  }
+
+  // ---- Signed integer writes ----
+
+  writeInt8(val: number, pos: number): number {
+    this[pos] = val & 0xff;
+    return pos + 1;
+  }
+
+  writeInt16BE(val: number, pos: number): number {
+    return this.writeUInt16BE(val & 0xffff, pos);
+  }
+
+  writeInt16LE(val: number, pos: number): number {
+    return this.writeUInt16LE(val & 0xffff, pos);
+  }
+
+  writeInt32BE(val: number, pos: number): number {
+    return this.writeUInt32BE(val >>> 0, pos);
+  }
+
+  writeInt32LE(val: number, pos: number): number {
+    return this.writeUInt32LE(val >>> 0, pos);
+  }
+
+  // ---- BigInt 64-bit reads ----
+
+  readBigUInt64LE(pos: number): bigint {
+    const lo = BigInt(this[pos] | (this[pos + 1] << 8) | (this[pos + 2] << 16) | (this[pos + 3] << 24)) & 0xffffffffn;
+    const hi = BigInt(this[pos + 4] | (this[pos + 5] << 8) | (this[pos + 6] << 16) | (this[pos + 7] << 24)) & 0xffffffffn;
+    return lo | (hi << 32n);
+  }
+
+  readBigUInt64BE(pos: number): bigint {
+    const hi = BigInt(this[pos] << 24 | this[pos + 1] << 16 | this[pos + 2] << 8 | this[pos + 3]) & 0xffffffffn;
+    const lo = BigInt(this[pos + 4] << 24 | this[pos + 5] << 16 | this[pos + 6] << 8 | this[pos + 7]) & 0xffffffffn;
+    return lo | (hi << 32n);
+  }
+
+  readBigInt64LE(pos: number): bigint {
+    const unsigned = this.readBigUInt64LE(pos);
+    return unsigned >= 0x8000000000000000n ? unsigned - 0x10000000000000000n : unsigned;
+  }
+
+  readBigInt64BE(pos: number): bigint {
+    const unsigned = this.readBigUInt64BE(pos);
+    return unsigned >= 0x8000000000000000n ? unsigned - 0x10000000000000000n : unsigned;
+  }
+
+  // ---- BigInt 64-bit writes ----
+
+  writeBigUInt64LE(val: bigint, pos: number): number {
+    const lo = val & 0xffffffffn;
+    const hi = (val >> 32n) & 0xffffffffn;
+    this[pos] = Number(lo & 0xffn);
+    this[pos + 1] = Number((lo >> 8n) & 0xffn);
+    this[pos + 2] = Number((lo >> 16n) & 0xffn);
+    this[pos + 3] = Number((lo >> 24n) & 0xffn);
+    this[pos + 4] = Number(hi & 0xffn);
+    this[pos + 5] = Number((hi >> 8n) & 0xffn);
+    this[pos + 6] = Number((hi >> 16n) & 0xffn);
+    this[pos + 7] = Number((hi >> 24n) & 0xffn);
+    return pos + 8;
+  }
+
+  writeBigUInt64BE(val: bigint, pos: number): number {
+    const lo = val & 0xffffffffn;
+    const hi = (val >> 32n) & 0xffffffffn;
+    this[pos] = Number((hi >> 24n) & 0xffn);
+    this[pos + 1] = Number((hi >> 16n) & 0xffn);
+    this[pos + 2] = Number((hi >> 8n) & 0xffn);
+    this[pos + 3] = Number(hi & 0xffn);
+    this[pos + 4] = Number((lo >> 24n) & 0xffn);
+    this[pos + 5] = Number((lo >> 16n) & 0xffn);
+    this[pos + 6] = Number((lo >> 8n) & 0xffn);
+    this[pos + 7] = Number(lo & 0xffn);
+    return pos + 8;
+  }
+
+  writeBigInt64LE(val: bigint, pos: number): number {
+    const unsigned = val < 0n ? val + 0x10000000000000000n : val;
+    return this.writeBigUInt64LE(unsigned, pos);
+  }
+
+  writeBigInt64BE(val: bigint, pos: number): number {
+    const unsigned = val < 0n ? val + 0x10000000000000000n : val;
+    return this.writeBigUInt64BE(unsigned, pos);
+  }
+
+  // Lowercase BigInt aliases
+  readBigUint64LE(pos: number): bigint { return this.readBigUInt64LE(pos); }
+  readBigUint64BE(pos: number): bigint { return this.readBigUInt64BE(pos); }
+  writeBigUint64LE(val: bigint, pos: number): number { return this.writeBigUInt64LE(val, pos); }
+  writeBigUint64BE(val: bigint, pos: number): number { return this.writeBigUInt64BE(val, pos); }
+
+  // ---- Float / Double reads ----
+
+  readFloatLE(pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 4);
+    return dv.getFloat32(0, true);
+  }
+
+  readFloatBE(pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 4);
+    return dv.getFloat32(0, false);
+  }
+
+  readDoubleLE(pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 8);
+    return dv.getFloat64(0, true);
+  }
+
+  readDoubleBE(pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 8);
+    return dv.getFloat64(0, false);
+  }
+
+  // ---- Float / Double writes ----
+
+  writeFloatLE(val: number, pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 4);
+    dv.setFloat32(0, val, true);
+    return pos + 4;
+  }
+
+  writeFloatBE(val: number, pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 4);
+    dv.setFloat32(0, val, false);
+    return pos + 4;
+  }
+
+  writeDoubleLE(val: number, pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 8);
+    dv.setFloat64(0, val, true);
+    return pos + 8;
+  }
+
+  writeDoubleBE(val: number, pos: number): number {
+    const dv = new DataView(this.buffer, this.byteOffset + pos, 8);
+    dv.setFloat64(0, val, false);
+    return pos + 8;
+  }
+
+  // ---- Variable-length integer reads ----
+
+  readUIntLE(pos: number, width: number): number {
+    let result = 0;
+    let factor = 1;
+    for (let i = 0; i < width; i++) {
+      result += this[pos + i] * factor;
+      factor *= 0x100;
+    }
+    return result;
+  }
+
+  readUintLE(pos: number, width: number): number { return this.readUIntLE(pos, width); }
+
+  readUIntBE(pos: number, width: number): number {
+    let result = 0;
+    let factor = 1;
+    for (let i = width - 1; i >= 0; i--) {
+      result += this[pos + i] * factor;
+      factor *= 0x100;
+    }
+    return result;
+  }
+
+  readUintBE(pos: number, width: number): number { return this.readUIntBE(pos, width); }
+
+  readIntLE(pos: number, width: number): number {
+    let raw = this.readUIntLE(pos, width);
+    const threshold = Math.pow(2, (width * 8) - 1);
+    if (raw >= threshold) raw -= Math.pow(2, width * 8);
+    return raw;
+  }
+
+  readIntBE(pos: number, width: number): number {
+    let raw = this.readUIntBE(pos, width);
+    const threshold = Math.pow(2, (width * 8) - 1);
+    if (raw >= threshold) raw -= Math.pow(2, width * 8);
+    return raw;
+  }
+
+  // ---- Variable-length integer writes ----
+
+  writeUIntLE(val: number, pos: number, width: number): number {
+    let remaining = val;
+    for (let i = 0; i < width; i++) {
+      this[pos + i] = remaining & 0xff;
+      remaining = Math.floor(remaining / 0x100);
+    }
+    return pos + width;
+  }
+
+  writeUintLE(val: number, pos: number, width: number): number { return this.writeUIntLE(val, pos, width); }
+
+  writeUIntBE(val: number, pos: number, width: number): number {
+    let remaining = val;
+    for (let i = width - 1; i >= 0; i--) {
+      this[pos + i] = remaining & 0xff;
+      remaining = Math.floor(remaining / 0x100);
+    }
+    return pos + width;
+  }
+
+  writeUintBE(val: number, pos: number, width: number): number { return this.writeUIntBE(val, pos, width); }
+
+  writeIntLE(val: number, pos: number, width: number): number {
+    let adjusted = val;
+    if (adjusted < 0) adjusted += Math.pow(2, width * 8);
+    return this.writeUIntLE(adjusted, pos, width);
+  }
+
+  writeIntBE(val: number, pos: number, width: number): number {
+    let adjusted = val;
+    if (adjusted < 0) adjusted += Math.pow(2, width * 8);
+    return this.writeUIntBE(adjusted, pos, width);
+  }
+
+  // ---- Byte swap methods ----
+
+  swap16(): this {
+    if (this.length % 2 !== 0) throw new RangeError('Buffer size must be a multiple of 16-bits');
+    for (let i = 0; i < this.length; i += 2) {
+      const tmp = this[i];
+      this[i] = this[i + 1];
+      this[i + 1] = tmp;
+    }
+    return this;
+  }
+
+  swap32(): this {
+    if (this.length % 4 !== 0) throw new RangeError('Buffer size must be a multiple of 32-bits');
+    for (let i = 0; i < this.length; i += 4) {
+      const a = this[i], b = this[i + 1];
+      this[i] = this[i + 3];
+      this[i + 1] = this[i + 2];
+      this[i + 2] = b;
+      this[i + 3] = a;
+    }
+    return this;
+  }
+
+  swap64(): this {
+    if (this.length % 8 !== 0) throw new RangeError('Buffer size must be a multiple of 64-bits');
+    for (let i = 0; i < this.length; i += 8) {
+      const a = this[i], b = this[i + 1], c = this[i + 2], d = this[i + 3];
+      this[i] = this[i + 7]; this[i + 1] = this[i + 6];
+      this[i + 2] = this[i + 5]; this[i + 3] = this[i + 4];
+      this[i + 4] = d; this[i + 5] = c;
+      this[i + 6] = b; this[i + 7] = a;
+    }
+    return this;
+  }
+}
+
+// Wrap BufferPolyfill so it can be called without `new` (like Node.js's deprecated Buffer())
+// Cast to BufferConstructor so downstream code sees Node.js-compatible Buffer types.
+const Buffer = new Proxy(BufferPolyfill, {
+  apply(_target, _thisArg, args) {
+    // Buffer(string, encoding) or Buffer(size) or Buffer(array) — deprecated but still works in Node
+    return (BufferPolyfill as any).from(...args);
+  },
+  construct(target, args, newTarget) {
+    // new Buffer("abc"[, enc]) is node's (deprecated) string form; as a
+    // typed array constructor it made an empty buffer
+    if (typeof args[0] === 'string') return (BufferPolyfill as any).from(...args);
+    return Reflect.construct(target, args, newTarget);
+  },
+}) as unknown as BufferConstructor & typeof BufferPolyfill;
+
+// Install on globalThis if missing
+if (typeof globalThis.Buffer === 'undefined') {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (globalThis as any).Buffer = Buffer;
+}
+
+export { Buffer };
+
+// Secondary exports matching Node.js `buffer` module surface
+export const SlowBuffer = Buffer;
+export const kMaxLength = 2147483647;
+export const INSPECT_MAX_BYTES = 50;
+
+// These are also exposed by node:buffer. Keep the host constructors so blobs
+// retain their native stream/structured-clone behavior across runtime workers.
+export const Blob = globalThis.Blob;
+export const File = globalThis.File;
+
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength")!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteOffset")!.get!;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, "buffer")!.get!;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === "undefined" ? null
+  : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")!.get!;
+
+function validationBytes(input: unknown): Uint8Array {
+  if (ArrayBuffer.isView(input)) {
+    // Intrinsic getters accept all typed arrays, including cross-realm views,
+    // and reject DataView. Validate the bytes, not the numeric elements.
+    let length: number;
+    try { length = typedArrayByteLength.call(input); }
+    catch { throw invalidValidationInput(); }
+    // Native Node accepts an empty (including detached) typed array.
+    if (length === 0) return new Uint8Array(0);
+    return new Uint8Array(typedArrayBuffer.call(input), typedArrayByteOffset.call(input), length);
+  }
+  let validBuffer = false;
+  try { arrayBufferByteLength.call(input); validBuffer = true; } catch {}
+  if (!validBuffer && sharedArrayBufferByteLength) {
+    try { sharedArrayBufferByteLength.call(input); validBuffer = true; } catch {}
+  }
+  if (!validBuffer) throw invalidValidationInput();
+  try { return new Uint8Array(input as ArrayBuffer); }
+  catch {
+    throw Object.assign(new Error("Cannot validate on a detached buffer"), { code: "ERR_INVALID_STATE" });
+  }
+}
+
+function invalidValidationInput(): TypeError & { code: string } {
+  return Object.assign(new TypeError("The \"input\" argument must be an instance of ArrayBuffer, Buffer, or TypedArray"),
+    { code: "ERR_INVALID_ARG_TYPE" });
+}
+
+export function isAscii(input: ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean {
+  const bytes = validationBytes(input);
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] > 0x7f) return false;
+  return true;
+}
+
+// Validate directly without allocating a decoded string. Reject overlong
+// encodings, UTF-16 surrogates and code points beyond U+10FFFF.
+export function isUtf8(input: ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean {
+  const bytes = validationBytes(input);
+  for (let i = 0; i < bytes.length;) {
+    const lead = bytes[i++];
+    if (lead <= 0x7f) continue;
+    let remaining: number;
+    let min = 0x80;
+    let max = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) remaining = 1;
+    else if (lead >= 0xe0 && lead <= 0xef) {
+      remaining = 2;
+      if (lead === 0xe0) min = 0xa0;
+      if (lead === 0xed) max = 0x9f;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+      remaining = 3;
+      if (lead === 0xf0) min = 0x90;
+      if (lead === 0xf4) max = 0x8f;
+    } else return false;
+    if (i + remaining > bytes.length || bytes[i] < min || bytes[i] > max) return false;
+    i++;
+    while (--remaining > 0) {
+      const byte = bytes[i++];
+      if (byte < 0x80 || byte > 0xbf) return false;
+    }
+  }
+  return true;
+}
+
+export const constants = {
+  MAX_LENGTH: kMaxLength,
+  MAX_STRING_LENGTH: 536870888,
+};
+
+export function transcode(
+  src: Uint8Array,
+  _fromEnc: string,
+  _toEnc: string
+): InstanceType<typeof BufferPolyfill> {
+  return BufferPolyfill.from(src);
+}
+
+export function resolveObjectURL(_id: string): undefined {
+  return undefined;
+}
+
+export function atob(data: string): string {
+  return globalThis.atob(data);
+}
+
+export function btoa(data: string): string {
+  return globalThis.btoa(data);
+}
+
+const bufferModule: Record<string, unknown> = {
+  Buffer: BufferPolyfill,
+  SlowBuffer,
+  kMaxLength,
+  INSPECT_MAX_BYTES,
+  Blob,
+  File,
+  isAscii,
+  isUtf8,
+  constants,
+  transcode,
+  resolveObjectURL,
+  atob,
+  btoa,
+};
+
+Object.defineProperty(bufferModule, 'hasOwnProperty', {
+  value: Object.prototype.hasOwnProperty,
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
+
+export default bufferModule;

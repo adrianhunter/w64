@@ -1,0 +1,23 @@
+{
+  "name": "qjs-wasm",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tools/test.mjs"
+  },
+  "devDependencies": {
+    "@hono/deno": "^1.0.2",
+    "@noble/hashes": "^1.8.0",
+    "brotli": "^1.3.3",
+    "esbuild": "^0.25.0",
+    "hono": "^4.13.13",
+    "pako": "^2.1.0",
+    "set-cookie-parser": "^3.1.2",
+    "ts-blank-space": "^0.9.0",
+    "typescript": "6.0.2",
+    "web-streams-polyfill": "^4.3.0",
+    "whatwg-url": "^17.1.2",
+    "yuku-codegen": "^0.17.0",
+    "yuku-parser": "^0.17.0"
+  }
+}

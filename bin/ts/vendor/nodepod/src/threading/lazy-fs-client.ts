@@ -1,0 +1,312 @@
+// Synchronous fs proxy client for lean spawn mode. The process worker blocks
+// on a SAB + Atomics.wait round-trip to the main thread, which services the
+// request with handleFsProxy (same wire protocol as the WASI fs proxy in
+// napi-wasm-worker.ts):
+//   request:  port.postMessage({ __fs__: { sab: Int32Array, type, payload } })
+//   header:   [0] status (-1 pending, 0 ok, 1 err)  [1] result type
+//             [2] payload byte length               [3] request sequence
+//   payload:  bytes after the 16-byte header
+// Result types: 0=undefined 1=null 2=bool 3=number 4=string 5=buffer 6=json 9=bigint
+
+import type { VolumeMissHandler } from "../memory-volume";
+
+const HEADER_BYTES = 16;
+const DEFAULT_PAYLOAD = 256 * 1024;
+const MAX_RETAINED_PAYLOAD = 4 * 1024 * 1024;
+// matches the WASI fs proxy. the main thread may be paging package content
+// back in from storage before it can answer
+const CALL_TIMEOUT_MS = 30000;
+const WASM_RECOVERY_TIMEOUT_MS = 120000;
+
+interface ProxyResult {
+  ok: boolean;
+  resultType: number;
+  bytes: Uint8Array; // copied out of the SAB
+  truncated: boolean;
+  fullLength: number;
+}
+
+interface CallState {
+  sab: SharedArrayBuffer | null;
+  capacity: number;
+  sequence: number;
+}
+
+function nextCapacity(required: number): number {
+  let capacity = DEFAULT_PAYLOAD;
+  while (capacity < required && capacity < MAX_RETAINED_PAYLOAD) capacity *= 2;
+  return Math.max(required, capacity);
+}
+
+function timeoutError(type: string, target: unknown): Error {
+  const err = new Error(`ETIMEDOUT: fs proxy ${type} got no answer for ${String(target)}`) as Error & {
+    code: string;
+  };
+  err.code = "ETIMEDOUT";
+  return err;
+}
+
+// null on a failed call; throws ETIMEDOUT when the main thread didn't answer
+// in time, which the volume treats as "unknown" rather than "missing"
+function call(
+  state: CallState,
+  port: MessagePort,
+  type: string,
+  payload: unknown[],
+  payloadCapacity: number,
+  envelope = "__fs__",
+): ProxyResult | null {
+  let sab: SharedArrayBuffer;
+  const retained = payloadCapacity <= MAX_RETAINED_PAYLOAD;
+  try {
+    if (retained && (!state.sab || state.capacity < payloadCapacity)) {
+      state.capacity = nextCapacity(payloadCapacity);
+      state.sab = new SharedArrayBuffer(HEADER_BYTES + state.capacity);
+    }
+    sab = retained
+      ? state.sab!
+      : new SharedArrayBuffer(HEADER_BYTES + payloadCapacity);
+  } catch {
+    return null;
+  }
+  const ctrl = new Int32Array(sab, 0, 4);
+  ctrl.fill(0);
+  Atomics.store(ctrl, 0, -1);
+  Atomics.store(ctrl, 3, ++state.sequence);
+
+  try {
+    port.postMessage({ [envelope]: { sab: ctrl, type, payload } });
+  } catch {
+    return null;
+  }
+
+  const target = payload[0];
+  const timeout = typeof target === "string"
+    && target.endsWith(".wasm")
+    && target.includes("/node_modules/")
+    ? WASM_RECOVERY_TIMEOUT_MS
+    : CALL_TIMEOUT_MS;
+  // wait until this call is answered, not just until woken: the answer to
+  // the call before can have been read before its notify came (the host
+  // notifies after storing it), and that notify then wakes this wait
+  const deadline = Date.now() + timeout;
+  let timedOut = false;
+  while (Atomics.load(ctrl, 0) === -1) {
+    const left = deadline - Date.now();
+    if (left <= 0 || Atomics.wait(ctrl, 0, -1, left) === "timed-out") {
+      timedOut = true;
+      break;
+    }
+  }
+  if (timedOut) {
+    if (retained && state.sab === sab) {
+      state.sab = null;
+      state.capacity = 0;
+    }
+    throw timeoutError(type, target);
+  }
+
+  const status = Atomics.load(ctrl, 0);
+  const resultType = Atomics.load(ctrl, 1);
+  const fullLength = Atomics.load(ctrl, 2);
+  const actualCapacity = sab.byteLength - HEADER_BYTES;
+  const available = Math.min(fullLength, actualCapacity);
+  const bytes = new Uint8Array(available);
+  bytes.set(new Uint8Array(sab, HEADER_BYTES, available));
+
+  return {
+    ok: status === 0,
+    resultType,
+    bytes,
+    truncated: fullLength > actualCapacity,
+    fullLength,
+  };
+}
+
+// the main thread answered with an error; EAGAIN (content couldn't be paged
+// in just now) says nothing about whether the file exists
+function throwIfTransient(res: ProxyResult | null, type: string, target: unknown): void {
+  if (!res || res.ok || res.resultType !== 6) return;
+  const err = decodeJson(res.bytes) as { code?: string } | null;
+  if (err?.code === "EAGAIN") {
+    const transient = new Error(`EAGAIN: fs proxy ${type} could not read ${String(target)} right now`) as Error & {
+      code: string;
+    };
+    transient.code = "EAGAIN";
+    throw transient;
+  }
+}
+
+const replyDecoder = new TextDecoder();
+
+function decodeJson(bytes: Uint8Array): unknown {
+  try {
+    return JSON.parse(replyDecoder.decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+/** [key, code, flags]: see threading/transform-store.ts */
+export type SharedTransformEntry = [key: string, code: string, flags: number];
+
+export interface SharedTransformClient {
+  /** Every cached transform of a package pack (one blocking round trip). */
+  loadPack(scope: string): SharedTransformEntry[];
+  /** Queue new transforms for the pack; sent after the current burst. */
+  put(scope: string, key: string, code: string, flags: number): void;
+}
+
+// Client for the main thread's shared transform store, over the same port as
+// the lazy fs proxy (its own SAB, so the two never share a request slot).
+export function createSharedTransformClient(
+  port: MessagePort,
+  knownScopes: string[] | null = [],
+): SharedTransformClient {
+  const state: CallState = { sab: null, capacity: 0, sequence: 0 };
+  // null: the main thread couldn't say yet which packs exist
+  const known = knownScopes ? new Set(knownScopes) : null;
+  let pending: Map<string, SharedTransformEntry[]> | null = null;
+  const flush = () => {
+    const batch = pending;
+    pending = null;
+    if (!batch) return;
+    for (const [scope, entries] of batch) {
+      try {
+        // serialized here: the main thread stores and forwards the text as is
+        port.postMessage({ __tcput__: { scope, text: JSON.stringify(entries) } });
+      } catch {
+        /* best effort */
+      }
+    }
+  };
+  return {
+    loadPack(scope: string): SharedTransformEntry[] {
+      if (known && !known.has(scope)) return [];
+      let res: ProxyResult | null = null;
+      try {
+        res = call(state, port, "transformPack", [scope], DEFAULT_PAYLOAD, "__tc__");
+        if (res && res.truncated) {
+          res = call(state, port, "transformPack", [scope], res.fullLength + 1024, "__tc__");
+        }
+      } catch {
+        return [];
+      }
+      if (!res || !res.ok || res.truncated) return [];
+      const entries = decodeJson(res.bytes);
+      return Array.isArray(entries) ? (entries as SharedTransformEntry[]) : [];
+    },
+    put(scope: string, key: string, code: string, flags: number): void {
+      if (!pending) {
+        pending = new Map();
+        // module loading is synchronous: one message per require() burst
+        queueMicrotask(flush);
+      }
+      let list = pending.get(scope);
+      if (!list) pending.set(scope, (list = []));
+      list.push([key, code, flags]);
+    },
+  };
+}
+
+// Builds a VolumeMissHandler backed by a dedicated MessagePort to the tab's
+// fs bridge. All methods return null on any failure (treated as a miss) and
+// throw ETIMEDOUT when the main thread doesn't answer in time; readFile also
+// throws EAGAIN when the main thread couldn't page the content in. Both are
+// transient: the volume doesn't remember them as a missing file.
+export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
+  const state: CallState = { sab: null, capacity: 0, sequence: 0 };
+  const knownSizes = new Map<string, number>();
+  return {
+    stat(path: string) {
+      const res = call(state, port, "statSync", [path], DEFAULT_PAYLOAD);
+      if (!res || !res.ok) return null;
+      const st = decodeJson(res.bytes) as
+        | { _isFile?: boolean; _isDir?: boolean; size?: number }
+        | null;
+      if (!st) return null;
+      const stat = {
+        isFile: !!st._isFile,
+        isDirectory: !!st._isDir,
+        size: st.size ?? 0,
+      };
+      if (stat.isFile) knownSizes.set(path, stat.size);
+      return stat;
+    },
+
+    statMany(paths: string[]) {
+      let res = call(state, port, "statMany", [paths], DEFAULT_PAYLOAD);
+      if (res && res.truncated) {
+        res = call(state, port, "statMany", [paths], res.fullLength + 1024);
+      }
+      if (!res || !res.ok) return null;
+      const stats = decodeJson(res.bytes) as Array<{
+        _isFile?: boolean;
+        _isDir?: boolean;
+        size?: number;
+      } | null> | null;
+      if (!Array.isArray(stats)) return null;
+      return stats.map((stat, index) => {
+        if (!stat) return null;
+        const value = {
+          isFile: !!stat._isFile,
+          isDirectory: !!stat._isDir,
+          size: stat.size ?? 0,
+        };
+        if (value.isFile && paths[index]) knownSizes.set(paths[index]!, value.size);
+        return value;
+      });
+    },
+
+    readFile(path: string) {
+      const knownSize = knownSizes.get(path) ?? 0;
+      let res = call(
+        state,
+        port,
+        "readFileSync",
+        [path],
+        knownSize > DEFAULT_PAYLOAD ? knownSize + 1024 : DEFAULT_PAYLOAD,
+      );
+      if (res && res.truncated) {
+        // retry with a buffer sized to the reported full length
+        res = call(state, port, "readFileSync", [path], res.fullLength + 1024);
+      }
+      throwIfTransient(res, "readFileSync", path);
+      if (!res || !res.ok) return null;
+      // buffer (5) or string (4) — the bridge returns bytes for no-encoding reads
+      if (res.resultType === 5 || res.resultType === 4) return res.bytes;
+      return null;
+    },
+
+    readdir(path: string) {
+      let res = call(state, port, "readdirWithTypes", [path], DEFAULT_PAYLOAD);
+      if (res && res.truncated) {
+        res = call(state, port, "readdirWithTypes", [path], res.fullLength + 1024);
+      }
+      if (!res || !res.ok) return null;
+      const entries = decodeJson(res.bytes) as
+        | Array<{ name?: string; _isDir?: boolean; _isSymlink?: boolean; _target?: string; size?: number }>
+        | null;
+      if (!Array.isArray(entries)) return null;
+      const out: Array<{ name: string; isDirectory: boolean; size?: number; isSymlink?: boolean; target?: string }> = [];
+      for (const e of entries) {
+        if (!e || typeof e.name !== "string") continue;
+        const entry: { name: string; isDirectory: boolean; size?: number; isSymlink?: boolean; target?: string } = {
+          name: e.name,
+          isDirectory: !!e._isDir,
+          size: e.size,
+        };
+        if (e._isSymlink) {
+          entry.isSymlink = true;
+          if (typeof e._target === "string") entry.target = e._target;
+        }
+        out.push(entry);
+        if (!entry.isDirectory && !entry.isSymlink && entry.size !== undefined) {
+          const child = path === "/" ? `/${entry.name}` : `${path}/${entry.name}`;
+          knownSizes.set(child, entry.size);
+        }
+      }
+      return out;
+    },
+  };
+}

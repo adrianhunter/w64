@@ -1,0 +1,104 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>ttsc browser verification</title>
+<pre id="out">running…</pre>
+<script>
+  globalThis.esmsInitOptions = {
+    shimMode: true,
+    polyfillEnable: ["all"],
+    noLoadEventRetriggers: true,
+  };
+</script>
+<script async src="/static/es-module-shims/dist/es-module-shims.debug.js"></script>
+<script type="importmap-shim">
+  {
+    "imports": {
+      "solid-js": "/node_modules/solid-js/dist/solid.js",
+      "@gpuix/solid": "/bin/ttsc/test/solid-stub.js"
+    }
+  }
+</script>
+<script type="module-shim">
+  const out = document.getElementById("out");
+  const lines = [];
+  const log = (line) => {
+    lines.push(line);
+    out.textContent = lines.join("\n");
+  };
+
+  const rewriteAssets = (code) =>
+    code.replace(
+      /from\s+"\.\.\/assets\/icons\/([A-Za-z0-9-]+)\.svg"\s+with\s+\{\s*type:\s*"text"\s*\};?/g,
+      `from "${location.origin}/bin/ttsc/test/icons/$1.js";`,
+    );
+
+  function serialize(value, seen = new Set()) {
+    if (value === null) return "null";
+    const t = typeof value;
+    if (t === "function") return `[fn:${value.name || "?"}]`;
+    if (t !== "object") return JSON.stringify(value);
+    if (seen.has(value)) return "[circular]";
+    seen.add(value);
+    if (Array.isArray(value)) return `[${value.map((v) => serialize(v, seen)).join(",")}]`;
+    const keys = Object.keys(value).sort();
+    const parts = keys.map((key) => {
+      try {
+        const v = value[key];
+        if (typeof v === "function") return `${JSON.stringify(key)}:[fn:${v.name || "?"}]`;
+        return `${JSON.stringify(key)}:${serialize(v, seen)}`;
+      } catch (e) {
+        return `${JSON.stringify(key)}:"<threw>"`;
+      }
+    });
+    return `{${parts.join(",")}}`;
+  }
+
+  async function executes(code) {
+    const url = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
+    const mod = await import(url);
+    const solid = await import("solid-js");
+    let tree;
+    solid.createRoot(() => {
+      tree = mod.ChatApp({ turnCount: 5 });
+    });
+    return serialize(tree);
+  }
+
+  try {
+    const ttsc = (await import("/bin/ttsc.wasm")).default;
+
+    // The `with { type: "file" }` import in gpuix's browser.mjs must become a
+    // URL expression, because browsers reject the attribute.
+    const browserMjs = await (await fetch("/node_modules/@gpuix/native/browser.mjs")).text();
+    const browserOut = ttsc(browserMjs, "browser.mjs");
+    if (!browserOut.includes("new URL(")) throw new Error("browser.mjs was not transformed");
+    if (browserOut.includes('type: "file"')) throw new Error("file attribute survived");
+    log("browser.mjs with type:file -> new URL: OK");
+
+    // Transform the real gpuix chat example in the browser.
+    const chatSource = rewriteAssets(await (await fetch("/bin/ttsc/test/chat.tsx")).text());
+    const ttscOut = ttsc(chatSource, "chat.tsx");
+    log(`ttsc output: ${ttscOut.length} bytes`);
+
+    const babelOut = rewriteAssets(await (await fetch("/bin/ttsc/test/chat.babel.mjs")).text());
+    log(`babel output: ${babelOut.length} bytes`);
+
+    // Execute both against real solid-js and the universal-runtime stub, then
+    // compare the host trees the components build.
+    const [ttscTree, babelTree] = await Promise.all([executes(ttscOut), executes(babelOut)]);
+    if (ttscTree === babelTree) {
+      log("execution tree matches babel-preset-solid: OK");
+    } else {
+      let i = 0;
+      while (i < ttscTree.length && ttscTree[i] === babelTree[i]) i++;
+      log(`tree mismatch at ${i}:`);
+      log(`ttsc : ${ttscTree.slice(Math.max(0, i - 80), i + 120)}`);
+      log(`babel: ${babelTree.slice(Math.max(0, i - 80), i + 120)}`);
+    }
+    log("DONE");
+    document.title = "ttsc-verify-done";
+  } catch (e) {
+    log("ERR " + (e && e.stack ? e.stack : e));
+    document.title = "ttsc-verify-done";
+  }
+</script>

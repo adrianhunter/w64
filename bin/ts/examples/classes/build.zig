@@ -1,0 +1,35 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_arch = .wasm32, .os_tag = .wasi } });
+    const optimize = b.standardOptimizeOption(.{});
+
+    const quickjs = b.dependency("quickjs", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "classes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "quickjs",
+                .module = quickjs.module("quickjs"),
+            }},
+        }),
+        // Zig 0.15 crashes without this.
+        .use_llvm = true,
+    });
+    exe.root_module.linkLibrary(quickjs.artifact("quickjs-ng"));
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
+
+    const run_step = b.step("run", "Run the example");
+    run_step.dependOn(&run_cmd.step);
+}

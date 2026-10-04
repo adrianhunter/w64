@@ -33,6 +33,7 @@ pub const Transformer = struct {
     namespace_imports: std.StringHashMap(void),
     declared: std.StringHashMap(void),
     const_names: std.StringHashMap(void),
+    const_values: std.StringHashMap(StaticValue),
 
     tree: *ast.Tree = undefined,
     source: []const u8 = "",
@@ -47,6 +48,7 @@ pub const Transformer = struct {
             .namespace_imports = std.StringHashMap(void).init(gpa),
             .declared = std.StringHashMap(void).init(gpa),
             .const_names = std.StringHashMap(void).init(gpa),
+            .const_values = std.StringHashMap(StaticValue).init(gpa),
         };
     }
 
@@ -58,6 +60,7 @@ pub const Transformer = struct {
         self.namespace_imports.deinit();
         self.declared.deinit();
         self.const_names.deinit();
+        self.const_values.deinit();
     }
 
     // ------------------------------------------------------------------
@@ -156,13 +159,9 @@ pub const Transformer = struct {
         if (self.import_map.get(name)) |local| return local;
         const local = try self.uid(try self.fmt("${s}", .{name}));
         try self.import_map.put(name, local);
-        try self.imports.appendSlice(self.gpa, "import { ");
-        try self.imports.appendSlice(self.gpa, name);
-        try self.imports.appendSlice(self.gpa, " as ");
-        try self.imports.appendSlice(self.gpa, local);
-        try self.imports.appendSlice(self.gpa, " } from \"");
-        try self.imports.appendSlice(self.gpa, self.options.module_name);
-        try self.imports.appendSlice(self.gpa, "\";\n");
+        // helper-module-imports unshifts each import, so the newest is first
+        const line = try self.fmt("import {{ {s} as {s} }} from \"{s}\";\n", .{ name, local, self.options.module_name });
+        try self.imports.insertSlice(self.gpa, 0, line);
         return local;
     }
 
@@ -175,29 +174,28 @@ pub const Transformer = struct {
     // ------------------------------------------------------------------
 
     fn trimWhitespace(self: *Transformer, text_in: []const u8) Error![]const u8 {
-        _ = self;
-        const text = try std.mem.replaceOwned(u8, std.heap.page_allocator, text_in, "\r", "");
-        defer std.heap.page_allocator.free(text);
+        const text = try std.mem.replaceOwned(u8, self.gpa, text_in, "\r", "");
+        defer self.gpa.free(text);
         if (std.mem.indexOfScalar(u8, text, '\n') == null) {
-            return try collapseSpaces(std.heap.page_allocator, text);
+            return try collapseSpaces(self.gpa, text);
         }
         var lines: Buf = .empty;
-        defer lines.deinit(std.heap.page_allocator);
+        defer lines.deinit(self.gpa);
         var it = std.mem.splitScalar(u8, text, '\n');
         var i: usize = 0;
         while (it.next()) |line| : (i += 1) {
             const trimmed = if (i == 0) line else std.mem.trimStart(u8, line, " \t");
             if (std.mem.trim(u8, trimmed, " \t").len == 0) continue;
-            try lines.appendSlice(std.heap.page_allocator, trimmed);
-            try lines.append(std.heap.page_allocator, '\n');
+            try lines.appendSlice(self.gpa, trimmed);
+            try lines.append(self.gpa, '\n');
         }
         var out: Buf = .empty;
         for (lines.items, 0..) |c, j| {
             if (c == '\n') {
-                if (j != lines.items.len - 1) try out.append(std.heap.page_allocator, ' ');
-            } else try out.append(std.heap.page_allocator, c);
+                if (j != lines.items.len - 1) try out.append(self.gpa, ' ');
+            } else try out.append(self.gpa, c);
         }
-        return try collapseSpaces(std.heap.page_allocator, out.items);
+        return try collapseSpaces(self.gpa, out.items);
     }
 
     fn collapseSpaces(alloc: Allocator, text: []const u8) Error![]const u8 {
@@ -218,7 +216,6 @@ pub const Transformer = struct {
     }
 
     fn escapeHtml(self: *Transformer, s: []const u8, attr: bool) Error![]const u8 {
-        _ = self;
         const delim: u8 = if (attr) '"' else '<';
         const esc: []const u8 = if (attr) "&quot;" else "&lt;";
         if (std.mem.indexOfScalar(u8, s, delim) == null and std.mem.indexOfScalar(u8, s, '&') == null)
@@ -226,12 +223,12 @@ pub const Transformer = struct {
         var out: Buf = .empty;
         for (s) |c| {
             if (c == delim) {
-                try out.appendSlice(std.heap.page_allocator, esc);
+                try out.appendSlice(self.gpa, esc);
             } else if (c == '&') {
-                try out.appendSlice(std.heap.page_allocator, "&amp;");
-            } else try out.append(std.heap.page_allocator, c);
+                try out.appendSlice(self.gpa, "&amp;");
+            } else try out.append(self.gpa, c);
         }
-        return out.toOwnedSlice(std.heap.page_allocator);
+        return out.toOwnedSlice(self.gpa);
     }
 
     fn escapeStringForTemplate(self: *Transformer, s: []const u8) Error![]const u8 {
@@ -270,7 +267,10 @@ pub const Transformer = struct {
                     self.t.putName(&self.t.declared, name);
                 },
                 .variable_declaration => |v| {
-                    if (v.kind == .@"const") self.t.collectPatternNames(v.declarators);
+                    if (v.kind == .@"const") {
+                        self.t.collectPatternNames(v.declarators);
+                        self.t.collectConstValues(v.declarators);
+                    }
                 },
                 else => {},
             }
@@ -282,6 +282,23 @@ pub const Transformer = struct {
         if (name.len == 0) return;
         const owned = self.gpa.dupe(u8, name) catch return;
         map.put(owned, {}) catch {};
+    }
+
+    fn collectConstValues(self: *Transformer, declarators: ast.IndexRange) void {
+        for (self.tree.extra(declarators)) |decl| {
+            const d = self.data(decl);
+            if (d != .variable_declarator) continue;
+            const vd = d.variable_declarator;
+            if (vd.init == .null) continue;
+            if (self.data(vd.id) != .binding_identifier) continue;
+            const value = self.evaluate(vd.init) orelse continue;
+            const name = self.gpa.dupe(u8, self.identName(vd.id)) catch continue;
+            const owned = switch (value) {
+                .string => |s| StaticValue{ .string = self.gpa.dupe(u8, s) catch continue },
+                else => value,
+            };
+            self.const_values.put(name, owned) catch {};
+        }
     }
 
     fn collectPatternNames(self: *Transformer, declarators: ast.IndexRange) void {
@@ -369,6 +386,8 @@ pub const Transformer = struct {
         }
 
         pub fn enter_object_property(self: *DynVisitor, p: ast.ObjectProperty, _: ast.NodeIndex, _: *basic.Ctx) traverser.Action {
+            const value_d = self.t.data(p.value);
+            if (!value_d.isCallable()) return .proceed;
             if (p.computed and self.opts.check_member) {
                 if (self.t.isDynamic(p.key, .{ .check_member = self.opts.check_member, .check_tags = self.opts.check_tags, .check_calls = self.opts.check_calls }) catch false) {
                     self.dynamic = true;
@@ -550,7 +569,10 @@ pub const Transformer = struct {
                 switch (b.operator) {
                     .add => switch (l) {
                         .string => |ls| switch (r) {
-                            .string => |rs| return .{ .string = std.fmt.allocPrint(self.gpa, "{s}{s}", .{ ls, rs }) catch null },
+                            .string => |rs| {
+                                const joined = std.fmt.allocPrint(self.gpa, "{s}{s}", .{ ls, rs }) catch return null;
+                                return .{ .string = joined };
+                            },
                             else => return null,
                         },
                         .number => |ln| switch (r) {
@@ -564,7 +586,7 @@ pub const Transformer = struct {
             },
             .identifier_reference => |i| {
                 const name = self.tree.string(i.name);
-                if (std.mem.eql(u8, name, "undefined")) return null;
+                if (self.const_values.get(name)) |v| return v;
                 return null;
             },
             else => return null,
@@ -715,7 +737,7 @@ pub const Transformer = struct {
                                 const use = try self.imp("use");
                                 const ns = key[4..];
                                 try res.exprs.append(self.gpa, try self.fmt("{s}({s}, {s}, () => {s})", .{
-                                    use, ns, res.id.?, try self.exprText(c.expression),
+                                    use, ns, res.id.?, try self.inlineAttrExpr(c.expression),
                                 }));
                             } else if (std.mem.eql(u8, key, "children")) {
                                 // handled by children
@@ -723,12 +745,12 @@ pub const Transformer = struct {
                                 try res.dynamics.append(self.gpa, .{
                                     .elem = res.id.?,
                                     .key = key,
-                                    .value = try self.exprText(c.expression),
+                                    .value = try self.inlineAttrExpr(c.expression),
                                 });
                             } else {
                                 const set_prop = try self.imp("setProp");
                                 try res.exprs.append(self.gpa, try self.fmt("{s}({s}, \"{s}\", {s})", .{
-                                    set_prop, res.id.?, key, try self.exprText(c.expression),
+                                    set_prop, res.id.?, key, try self.inlineAttrExpr(c.expression),
                                 }));
                             }
                         },
@@ -742,6 +764,55 @@ pub const Transformer = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    /// babel's `evaluateAndInline` for an intrinsic element's attribute value:
+    /// conservative constant folding, recursing through object literals.
+    fn inlineAttrExpr(self: *Transformer, idx: ast.NodeIndex) Error![]const u8 {
+        switch (self.data(idx)) {
+            .object_expression => |o| {
+                var parts: std.ArrayList([]const u8) = .empty;
+                for (self.tree.extra(o.properties)) |prop| {
+                    const pd = self.data(prop);
+                    if (pd != .object_property) {
+                        try parts.append(self.gpa, try self.exprText(prop));
+                        continue;
+                    }
+                    const p = pd.object_property;
+                    const key_text = if (p.computed) blk: {
+                        break :blk try self.fmt("[{s}]", .{try self.exprText(p.key)});
+                    } else self.slice(p.key);
+                    const value_text = try self.inlineAttrExpr(p.value);
+                    if (p.shorthand and std.mem.eql(u8, key_text, value_text)) {
+                        try parts.append(self.gpa, key_text);
+                    } else {
+                        try parts.append(self.gpa, try self.fmt("{s}: {s}", .{ key_text, value_text }));
+                    }
+                }
+                if (parts.items.len == 0) return "{}";
+                return self.fmt("{{ {s} }}", .{try self.join(parts.items, ", ")});
+            },
+            .string_literal,
+            .numeric_literal,
+            .boolean_literal,
+            .null_literal,
+            .bigint_literal,
+            .regexp_literal,
+            .template_literal,
+            .function,
+            .arrow_function_expression,
+            => return self.exprText(idx),
+            else => {
+                if (self.evaluate(idx)) |v| {
+                    switch (v) {
+                        .string => |s| return self.fmt("\"{s}\"", .{try escapeQuotes(self.gpa, s)}),
+                        .number => |n| return self.fmt("{d}", .{n}),
+                        .boolean => |b| return if (b) "true" else "false",
+                    }
+                }
+                return self.exprText(idx);
+            },
         }
     }
 
@@ -853,9 +924,6 @@ pub const Transformer = struct {
                 } else {
                     try res.exprs.append(self.gpa, try self.fmt("{s}({s}, {s});", .{ insert, res.id.?, child.exprs.items[0] }));
                 }
-                try appendList(&res.declarations, child.declarations, self.gpa);
-                try appendList(&res.exprs, child.exprs, self.gpa);
-                try appendDyn(&res.dynamics, child.dynamics, self.gpa);
             }
         }
         var merged: std.ArrayList([]const u8) = .empty;
@@ -865,19 +933,11 @@ pub const Transformer = struct {
     }
 
     fn nextChild(self: *Transformer, children: []?Result, index: usize) Error!?[]const u8 {
-        var i = index + 1;
-        while (i < children.len) : (i += 1) {
-            if (children[i]) |c| {
-                if (c.id) |id| return id;
-                if (c.exprs.items.len > 0) {
-                    const insert = try self.imp("insert");
-                    _ = insert;
-                    // nextChild only skips expression children in babel
-                    continue;
-                }
-            }
+        if (index + 1 >= children.len) return null;
+        if (children[index + 1]) |c| {
+            if (c.id) |id| return id;
         }
-        return null;
+        return self.nextChild(children, index + 1);
     }
 
     fn filterChildren(self: *Transformer, children: ast.IndexRange) Error!std.ArrayList(ast.NodeIndex) {
@@ -921,7 +981,7 @@ pub const Transformer = struct {
         }
         if (self.isConditional(expr)) {
             const modified = try self.conditionText(expr, info.component_child or info.fragment_child);
-            return Result{ .exprs = try one(self.gpa, modified), .dynamic = true };
+            return Result{ .exprs = try one(self.gpa, try self.fmt("() => {s}", .{modified})), .dynamic = true };
         }
         const d = self.data(expr);
         if (!info.component_child and d == .call_expression) {
@@ -1242,7 +1302,7 @@ pub const Transformer = struct {
                 }
                 return .{ .body = t, .body_is_block = false, .dynamic = true };
             }
-            return .{ .body = t, .body_is_block = false, .dynamic = any_dynamic };
+            return .{ .body = bodyOf(t), .body_is_block = false, .dynamic = any_dynamic };
         }
 
         const arr = try self.fmt("[{s}]", .{try self.join(texts.items, ", ")});
@@ -1287,10 +1347,12 @@ pub const Transformer = struct {
         }
         if (try self.wrapDynamics(res)) |dyn| {
             try body.appendSlice(self.gpa, dyn);
+            if (dyn.len > 0 and dyn[dyn.len - 1] != ';') try body.append(self.gpa, ';');
             try body.append(self.gpa, ' ');
         }
         for (res.post_exprs.items) |e| {
             try body.appendSlice(self.gpa, e);
+            if (e.len > 0 and e[e.len - 1] != ';') try body.append(self.gpa, ';');
             try body.append(self.gpa, ' ');
         }
         try body.appendSlice(self.gpa, "return ");
@@ -1480,6 +1542,13 @@ pub const Transformer = struct {
     }
 
 };
+
+/// Babel reads `.body` from the thunk an expression child produces: strip the
+/// `() => ` wrapper so a getter returns the expression directly.
+fn bodyOf(text: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, text, "() => ")) return text["() => ".len..];
+    return text;
+}
 
 fn checkLength(t: *Transformer, children: []const ast.NodeIndex) bool {
     var i: usize = 0;

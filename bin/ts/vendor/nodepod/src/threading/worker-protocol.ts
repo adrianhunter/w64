@@ -1,0 +1,564 @@
+// Worker Protocol — typed messages for main<->worker communication.
+// Flows via postMessage. Binary data (VFS snapshots) transferred zero-copy.
+
+import type { ShellOptions } from "../shell/shell-options";
+import type { FetchPolicy } from "../cross-origin";
+
+// --- VFS snapshot (binary transfer) ---
+
+export interface VFSBinarySnapshot {
+  manifest: VFSSnapshotEntry[];
+  data: ArrayBuffer;
+  // directory names excluded from the snapshot (lean spawn mode). the worker
+  // installs a lazy fs fallback for paths under these names.
+  lazyDirNames?: string[];
+  // set when the snapshot is a package pack restored from the snapshot
+  // cache under this key; lets the main thread page it from the cache
+  // instead of keeping the forwarded bytes
+  sourceKey?: string;
+}
+
+export interface VFSSnapshotEntry {
+  path: string;
+  offset: number;
+  length: number;
+  isDirectory: boolean;
+  symlinkTarget?: string;
+  inode?: number;
+  mode?: number;
+  atimeMs?: number;
+  mtimeMs?: number;
+  ctimeMs?: number;
+  nlink?: number;
+}
+
+// --- Main -> Worker messages ---
+
+export interface MainToWorker_Init {
+  type: "init";
+  pid: number;
+  cwd: string;
+  env: Record<string, string>;
+  shell?: ShellOptions;
+  snapshot: VFSBinarySnapshot;
+  syncBuffer?: SharedArrayBuffer;
+  // tab-side fs proxy ports, one per WASI worker the spawned process will
+  // create. chrome BC workaround (see process-manager spawn). #54 follow-up
+  wasiFsPorts?: MessagePort[];
+  // dedicated fs proxy port for the process worker's own lazy VFS reads
+  // (lean spawn mode — snapshot excluded node_modules etc.)
+  lazyFsPort?: MessagePort;
+  // node:sqlite engine policy for this process. "lazy" (default): nothing at
+  // init — the first DatabaseSync pulls the wasm bytes from the host and
+  // instantiates synchronously. "bytes": pre-cache the bytes in the pod VFS
+  // during init. "engine": full engine boot before ready (forced anyway when
+  // the worker has no SharedArrayBuffer, since the sync path needs it).
+  sqliteStartup?: "lazy" | "bytes" | "engine";
+  // shared transform store packs that exist (see transform-store.ts)
+  /** persisted transform packs; null when unknown (ask for every package) */
+  transformScopes?: string[] | null;
+  /** the main thread saves this process's installs' package packs (pack-save) */
+  deferPackSave?: boolean;
+  /** the host's CORS proxy + fetch allowlist (cross-origin.ts) */
+  fetchPolicy?: FetchPolicy;
+}
+
+export interface MainToWorker_Probe {
+  type: "probe";
+}
+
+export interface MainToWorker_Exec {
+  type: "exec";
+  filePath: string;
+  args: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  isShell?: boolean;
+  shellCommand?: string;
+  isFork?: boolean;
+  serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+  execArgv?: string[];
+  // If true, worker sends "shell-done" instead of "exit" and stays alive
+  persistent?: boolean;
+  isWorkerThread?: boolean;
+  workerData?: unknown;
+  threadId?: number;
+  // false when the parent process reads this one's stdout through a pipe
+  stdoutIsTTY?: boolean;
+}
+
+export interface MainToWorker_Stdin {
+  type: "stdin";
+  data: string;
+  end?: boolean;
+}
+
+export interface MainToWorker_Signal {
+  type: "signal";
+  signal: string;
+}
+
+export interface MainToWorker_Resize {
+  type: "resize";
+  cols: number;
+  rows: number;
+}
+
+export interface MainToWorker_VFSSync {
+  type: "vfs-sync";
+  path: string;
+  content: ArrayBuffer | null; // null = deleted
+  isDirectory: boolean;
+}
+
+export interface MainToWorker_VFSSnapshot {
+  type: "vfs-snapshot";
+  snapshot: VFSBinarySnapshot;
+}
+
+// large-file change notification (lean spawn mode): no bytes on the wire,
+// the worker drops its local copy and re-pulls over the lazy fs proxy on
+// next access
+export interface MainToWorker_VFSInvalidate {
+  type: "vfs-invalidate";
+  path: string;
+}
+
+// the main thread mounted entries in these directories without per-file
+// broadcasts (package cache restores): listed copies are stale
+export interface MainToWorker_VFSRelist {
+  type: "vfs-relist";
+  paths: string[];
+}
+
+export interface MainToWorker_VFSChunk {
+  type: "vfs-chunk";
+  chunkIndex: number;
+  totalChunks: number;
+  data: ArrayBuffer;
+  manifest: VFSSnapshotEntry[];
+}
+
+export interface MainToWorker_SpawnResult {
+  type: "spawn-result";
+  requestId: number;
+  pid: number;
+  error?: string;
+}
+
+export interface MainToWorker_ChildOutput {
+  type: "child-output";
+  requestId: number;
+  stream: "stdout" | "stderr";
+  data: string;
+}
+
+export interface MainToWorker_ChildExit {
+  type: "child-exit";
+  requestId: number;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface MainToWorker_HttpRequest {
+  type: "http-request";
+  requestId: number;
+  port: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: string | ArrayBuffer | null;
+}
+
+export interface MainToWorker_HttpClientResponse {
+  type: "http-client-response";
+  requestId: number;
+  statusCode: number;
+  statusMessage: string;
+  headers: Record<string, string | string[]>;
+  body: string | ArrayBuffer;
+  // no virtual server listens on the requested port: the client should see
+  // ECONNREFUSED (node parity) rather than a synthetic HTTP status
+  connectionRefused?: boolean;
+}
+
+export interface MainToWorker_IPC {
+  type: "ipc-message";
+  data: unknown;
+  // Routes to a specific fork callback when sent to a parent worker
+  targetRequestId?: number;
+}
+
+export interface IPCDisconnect {
+  type: "ipc-disconnect";
+  targetRequestId?: number;
+}
+
+export interface MainToWorker_WsUpgrade {
+  type: "ws-upgrade";
+  uid: string;
+  port: number;
+  path: string;
+  headers: Record<string, string>;
+}
+
+export interface MainToWorker_WsData {
+  type: "ws-data";
+  uid: string;
+  frame: number[]; // encoded WS frame bytes (number[] for postMessage)
+}
+
+export interface MainToWorker_WsClose {
+  type: "ws-close";
+  uid: string;
+  code: number;
+}
+
+// Session-wide compiled esbuild-wasm module (null when unavailable), sent in
+// reply to WorkerToMain_EsbuildModuleRequest.
+export interface MainToWorker_EsbuildModule {
+  type: "esbuild-module";
+  module: WebAssembly.Module | null;
+}
+
+export type MainToWorkerMessage =
+  | MainToWorker_EsbuildModule
+  | MainToWorker_Init
+  | MainToWorker_Probe
+  | MainToWorker_Exec
+  | MainToWorker_Stdin
+  | MainToWorker_Signal
+  | MainToWorker_Resize
+  | MainToWorker_VFSSync
+  | MainToWorker_VFSSnapshot
+  | MainToWorker_VFSInvalidate
+  | MainToWorker_VFSRelist
+  | MainToWorker_VFSChunk
+  | MainToWorker_SpawnResult
+  | MainToWorker_ChildOutput
+  | MainToWorker_ChildExit
+  | MainToWorker_HttpRequest
+  | MainToWorker_HttpClientResponse
+  | MainToWorker_IPC
+  | IPCDisconnect
+  | MainToWorker_WsUpgrade
+  | MainToWorker_WsData
+  | MainToWorker_WsClose;
+
+// --- Worker -> Main messages ---
+
+export interface WorkerToMain_Ready {
+  type: "ready";
+  pid: number;
+}
+
+export interface WorkerToMain_ProbeReady {
+  type: "probe-ready";
+}
+
+export interface WorkerToMain_Stdout {
+  type: "stdout";
+  data: string;
+}
+
+export interface WorkerToMain_Stderr {
+  type: "stderr";
+  data: string;
+}
+
+export interface WorkerToMain_Exit {
+  type: "exit";
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface WorkerToMain_Console {
+  type: "console";
+  method: string;
+  args: string[];
+}
+
+export interface WorkerToMain_VFSWrite {
+  type: "vfs-write";
+  path: string;
+  content: ArrayBuffer;
+  isDirectory: boolean;
+}
+
+export interface WorkerToMain_VFSDelete {
+  type: "vfs-delete";
+  path: string;
+}
+
+// the vfs-write / vfs-delete messages of one burst of changes (a directory
+// moved or removed: an install's package landing in node_modules), in order
+export interface WorkerToMain_VFSBatch {
+  type: "vfs-batch";
+  ops: Array<
+    | { path: string; content: ArrayBuffer; isDirectory: boolean }
+    | { path: string; deleted: true }
+  >;
+}
+
+export interface WorkerToMain_VFSSnapshot {
+  type: "vfs-snapshot";
+  snapshot: VFSBinarySnapshot;
+}
+
+// chmod/chown/utimes in a worker: watchers don't see metadata changes, so
+// they travel separately from vfs-write. only the fields the call changed
+// are set (a lazily fetched worker copy has made-up values for the rest)
+export interface WorkerToMain_VFSMeta {
+  type: "vfs-meta";
+  path: string;
+  mode?: number;
+  uid?: number;
+  gid?: number;
+  atimeMs?: number;
+  mtimeMs?: number;
+}
+
+export interface WorkerToMain_SpawnRequest {
+  type: "spawn-request";
+  requestId: number;
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  shell?: ShellOptions;
+  // legacy single-string form or node's [stdin, stdout, stderr] array.
+  // main normalizes either shape via stdioInheritsStdin().
+  stdio: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
+}
+
+export interface WorkerToMain_ChildSignal {
+  type: "child-signal";
+  requestId: number;
+  signal: string;
+}
+
+export interface WorkerToMain_ChildStdin {
+  type: "child-stdin";
+  requestId: number;
+  data: string;
+  end?: boolean;
+}
+
+export interface WorkerToMain_ForkRequest {
+  type: "fork-request";
+  requestId: number;
+  modulePath: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+  execArgv?: string[];
+}
+
+export interface WorkerToMain_WorkerThreadRequest {
+  type: "workerthread-request";
+  requestId: number;
+  modulePath: string; // absolute path, or inline code if isEval
+  isEval?: boolean;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  workerData: unknown;
+  threadId: number;
+}
+
+export interface WorkerToMain_WasiWorkerRequest {
+  type: "wasiworker-request";
+  requestId: number;
+  source: string;
+  name: string;
+  workerData: unknown;
+}
+
+export interface WorkerToMain_WasiWorkerTerminate {
+  type: "wasiworker-terminate";
+  requestId: number;
+}
+
+export interface WorkerToMain_SpawnSync {
+  type: "spawn-sync";
+  requestId: number;
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  syncSlot: number; // index in the sync SAB for Atomics.wait/notify
+  shellCommand?: string;
+  // optional node-shape array, defaults to ["pipe","pipe","pipe"] if absent
+  stdio?: Array<"pipe" | "inherit" | "ignore">;
+}
+
+// the worker read one chunk of a sync result and wants the next
+export interface WorkerToMain_SyncMore {
+  type: "sync-more";
+  syncSlot: number;
+}
+
+export interface WorkerToMain_ServerListen {
+  type: "server-listen";
+  port: number;
+  hostname: string;
+}
+
+export interface WorkerToMain_ServerClose {
+  type: "server-close";
+  port: number;
+}
+
+export interface WorkerToMain_HttpRequest {
+  type: "http-request";
+  requestId: number;
+  port: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: string | null;
+}
+
+export interface WorkerToMain_HttpClientRequest {
+  type: "http-client-request";
+  requestId: number;
+  port: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: string | null;
+}
+
+export interface WorkerToMain_CwdChange {
+  type: "cwd-change";
+  cwd: string;
+}
+
+export interface WorkerToMain_StdinRawStatus {
+  type: "stdin-raw-status";
+  isRaw: boolean;
+}
+
+export interface WorkerToMain_HttpResponse {
+  type: "http-response";
+  requestId: number;
+  statusCode: number;
+  statusMessage: string;
+  headers: Record<string, string | string[]>;
+  body: string | ArrayBuffer;
+}
+
+export interface WorkerToMain_IPC {
+  type: "ipc-message";
+  data: unknown;
+  targetRequestId?: number;
+}
+
+export interface WorkerToMain_ShellDone {
+  type: "shell-done";
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface WorkerToMain_Error {
+  type: "error";
+  message: string;
+  stack?: string;
+}
+
+export interface WorkerToMain_SqlitePreload {
+  type: "sqlite-preload";
+  /**
+   * SharedArrayBuffer layout:
+   *   [0] status (0 pending, 1 ok, 2 fail)
+   *   [1] wasm byte length (set by main on success)
+   *   bytes [16..] wasm payload (main writes, worker reads after notify)
+   * null: only cache the bytes on the main thread; no answer is sent
+   */
+  sab: Int32Array | null;
+}
+
+export interface WorkerToMain_WsFrame {
+  type: "ws-frame";
+  uid: string;
+  kind: string; // "open" | "text" | "binary" | "close" | "error"
+  data?: string;
+  bytes?: number[];
+  code?: number;
+  message?: string;
+}
+
+export interface WorkerToMain_EsbuildModuleRequest {
+  type: "esbuild-module-request";
+}
+
+export type WorkerToMainMessage =
+  | WorkerToMain_EsbuildModuleRequest
+  | WorkerToMain_Ready
+  | WorkerToMain_ProbeReady
+  | WorkerToMain_Stdout
+  | WorkerToMain_Stderr
+  | WorkerToMain_Exit
+  | WorkerToMain_Console
+  | WorkerToMain_VFSWrite
+  | WorkerToMain_VFSDelete
+  | WorkerToMain_VFSBatch
+  | WorkerToMain_VFSSnapshot
+  | WorkerToMain_VFSMeta
+  | WorkerToMain_SpawnRequest
+  | WorkerToMain_ChildSignal
+  | WorkerToMain_ChildStdin
+  | WorkerToMain_ForkRequest
+  | WorkerToMain_WorkerThreadRequest
+  | WorkerToMain_WasiWorkerRequest
+  | WorkerToMain_WasiWorkerTerminate
+  | WorkerToMain_SpawnSync
+  | WorkerToMain_SyncMore
+  | WorkerToMain_ServerListen
+  | WorkerToMain_ServerClose
+  | WorkerToMain_HttpRequest
+  | WorkerToMain_HttpClientRequest
+  | WorkerToMain_CwdChange
+  | WorkerToMain_StdinRawStatus
+  | WorkerToMain_HttpResponse
+  | WorkerToMain_IPC
+  | IPCDisconnect
+  | WorkerToMain_ShellDone
+  | WorkerToMain_Error
+  | WorkerToMain_SqlitePreload
+  | WorkerToMain_PackSave
+  | WorkerToMain_WsFrame;
+
+/** An install finished: save its node_modules as the package pack `key`. */
+export interface WorkerToMain_PackSave {
+  type: "pack-save";
+  key: string;
+}
+
+// --- Spawn config ---
+
+export interface SpawnConfig {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  shell?: ShellOptions;
+  snapshot: VFSBinarySnapshot;
+  syncBuffer?: SharedArrayBuffer;
+  parentPid?: number;
+}
+
+// --- Process info ---
+
+export interface ProcessInfo {
+  pid: number;
+  command: string;
+  args: string[];
+  state: "starting" | "running" | "exited";
+  exitCode?: number;
+  parentPid?: number;
+}

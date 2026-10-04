@@ -736,7 +736,7 @@ const Printer = struct {
                     const fn_name = "emit_" ++ @tagName(tag);
                     if (comptime @hasDecl(Self, fn_name)) {
                         const f = @field(Self, fn_name);
-                        if (comptime @typeInfo(@TypeOf(f)).@"fn".params.len == 3) {
+                        if (comptime @typeInfo(@TypeOf(f)).@"fn".param_types.len == 3) {
                             try @call(.never_inline, f, .{ self, node, ctx });
                         } else {
                             try @call(.never_inline, f, .{ self, node });
@@ -866,7 +866,7 @@ const Printer = struct {
         });
     }
 
-    fn emit_program(self: *Self, p: *const ast.Program) Error!void {
+    pub fn emit_program(self: *Self, p: *const ast.Program) Error!void {
         if (p.hashbang) |h| {
             try self.out.writeStr("#!");
             try self.writeString(h.value);
@@ -952,21 +952,21 @@ const Printer = struct {
         }
     }
 
-    fn emit_block_statement(self: *Self, s: *const ast.BlockStatement) Error!void {
+    pub fn emit_block_statement(self: *Self, s: *const ast.BlockStatement) Error!void {
         try self.printBlock(s.body, false);
     }
 
-    fn emit_function_body(self: *Self, b: *const ast.FunctionBody) Error!void {
+    pub fn emit_function_body(self: *Self, b: *const ast.FunctionBody) Error!void {
         try self.printBlock(b.body, true);
     }
 
-    fn emit_static_block(self: *Self, b: *const ast.StaticBlock) Error!void {
+    pub fn emit_static_block(self: *Self, b: *const ast.StaticBlock) Error!void {
         try self.out.writeStr("static");
         try self.out.space();
         try self.printBlock(b.body, false);
     }
 
-    fn emit_directive(self: *Self, d: *const ast.Directive) Error!void {
+    pub fn emit_directive(self: *Self, d: *const ast.Directive) Error!void {
         // an escaped `"use strict"` does not enable strict mode, so the raw lexeme must survive
         switch (self.nodeData(d.expression)) {
             .string_literal => |lit| try self.writeString(lit.raw),
@@ -975,17 +975,17 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_empty_statement(self: *Self, _: *const ast.EmptyStatement) Error!void {
+    pub fn emit_empty_statement(self: *Self, _: *const ast.EmptyStatement) Error!void {
         // not deferred, `if(x);` needs the `;` to materialize the body
         try self.out.writeByte(';');
     }
 
-    fn emit_debugger_statement(self: *Self, _: *const ast.DebuggerStatement) Error!void {
+    pub fn emit_debugger_statement(self: *Self, _: *const ast.DebuggerStatement) Error!void {
         try self.out.writeStr("debugger");
         try self.softSemi();
     }
 
-    fn emit_expression_statement(self: *Self, s: *const ast.ExpressionStatement) Error!void {
+    pub fn emit_expression_statement(self: *Self, s: *const ast.ExpressionStatement) Error!void {
         const as_directive = self.in_prologue and self.nodeData(s.expression) == .string_literal;
         self.in_prologue = false;
         if (as_directive) {
@@ -1000,7 +1000,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_if_statement(self: *Self, s: *const ast.IfStatement) Error!void {
+    pub fn emit_if_statement(self: *Self, s: *const ast.IfStatement) Error!void {
         try self.out.writeStr("if");
         try self.out.space();
         try self.out.writeByte('(');
@@ -1016,13 +1016,13 @@ const Printer = struct {
         }
     }
 
-    fn emit_return_statement(self: *Self, s: *const ast.ReturnStatement) Error!void {
+    pub fn emit_return_statement(self: *Self, s: *const ast.ReturnStatement) Error!void {
         try self.out.writeStr("return");
         try self.emitRestrictedArg(s.argument, .{});
         try self.softSemi();
     }
 
-    fn emit_throw_statement(self: *Self, s: *const ast.ThrowStatement) Error!void {
+    pub fn emit_throw_statement(self: *Self, s: *const ast.ThrowStatement) Error!void {
         try self.out.writeStr("throw");
         try self.emitRestrictedArg(s.argument, .{});
         try self.softSemi();
@@ -1058,11 +1058,11 @@ const Printer = struct {
         try self.out.writeStr(" (");
     }
 
-    fn emit_break_statement(self: *Self, s: *const ast.BreakStatement) Error!void {
+    pub fn emit_break_statement(self: *Self, s: *const ast.BreakStatement) Error!void {
         try self.printJump("break", s.label);
     }
 
-    fn emit_continue_statement(self: *Self, s: *const ast.ContinueStatement) Error!void {
+    pub fn emit_continue_statement(self: *Self, s: *const ast.ContinueStatement) Error!void {
         try self.printJump("continue", s.label);
     }
 
@@ -1075,14 +1075,14 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_labeled_statement(self: *Self, s: *const ast.LabeledStatement) Error!void {
+    pub fn emit_labeled_statement(self: *Self, s: *const ast.LabeledStatement) Error!void {
         try self.emit(s.label);
         try self.out.writeByte(':');
         try self.out.space();
         try self.emitStmt(s.body);
     }
 
-    fn emit_with_statement(self: *Self, s: *const ast.WithStatement) Error!void {
+    pub fn emit_with_statement(self: *Self, s: *const ast.WithStatement) Error!void {
         try self.out.writeStr("with");
         try self.out.space();
         try self.out.writeByte('(');
@@ -1092,7 +1092,7 @@ const Printer = struct {
         try self.emitStmt(s.body);
     }
 
-    fn emit_while_statement(self: *Self, s: *const ast.WhileStatement) Error!void {
+    pub fn emit_while_statement(self: *Self, s: *const ast.WhileStatement) Error!void {
         try self.out.writeStr("while");
         try self.out.space();
         try self.out.writeByte('(');
@@ -1102,7 +1102,7 @@ const Printer = struct {
         try self.emitStmt(s.body);
     }
 
-    fn emit_do_while_statement(self: *Self, s: *const ast.DoWhileStatement) Error!void {
+    pub fn emit_do_while_statement(self: *Self, s: *const ast.DoWhileStatement) Error!void {
         try self.out.writeStr("do ");
         try self.emitStmt(s.body);
         try self.flushSemi();
@@ -1114,7 +1114,7 @@ const Printer = struct {
         try self.out.writeStr(");");
     }
 
-    fn emit_for_statement(self: *Self, s: *const ast.ForStatement) Error!void {
+    pub fn emit_for_statement(self: *Self, s: *const ast.ForStatement) Error!void {
         try self.out.writeStr("for");
         try self.out.space();
         try self.out.writeByte('(');
@@ -1137,7 +1137,7 @@ const Printer = struct {
         try self.emitStmt(s.body);
     }
 
-    fn emit_for_in_statement(self: *Self, s: *const ast.ForInStatement) Error!void {
+    pub fn emit_for_in_statement(self: *Self, s: *const ast.ForInStatement) Error!void {
         try self.out.writeStr("for");
         try self.out.space();
         try self.out.writeByte('(');
@@ -1149,7 +1149,7 @@ const Printer = struct {
         try self.emitStmt(s.body);
     }
 
-    fn emit_for_of_statement(self: *Self, s: *const ast.ForOfStatement) Error!void {
+    pub fn emit_for_of_statement(self: *Self, s: *const ast.ForOfStatement) Error!void {
         try self.out.writeStr("for");
         if (s.await) try self.out.writeStr(" await");
         try self.out.space();
@@ -1173,7 +1173,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_switch_statement(self: *Self, s: *const ast.SwitchStatement) Error!void {
+    pub fn emit_switch_statement(self: *Self, s: *const ast.SwitchStatement) Error!void {
         try self.out.writeStr("switch");
         try self.out.space();
         try self.out.writeByte('(');
@@ -1194,7 +1194,7 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_switch_case(self: *Self, c: *const ast.SwitchCase) Error!void {
+    pub fn emit_switch_case(self: *Self, c: *const ast.SwitchCase) Error!void {
         if (c.@"test" != .null) {
             try self.out.writeStr("case ");
             try self.emit(c.@"test");
@@ -1206,7 +1206,7 @@ const Printer = struct {
         _ = try self.printIndentedStmtList(c.consequent, false);
     }
 
-    fn emit_try_statement(self: *Self, s: *const ast.TryStatement) Error!void {
+    pub fn emit_try_statement(self: *Self, s: *const ast.TryStatement) Error!void {
         try self.out.writeStr("try ");
         try self.emit(s.block);
         if (s.handler != .null) {
@@ -1220,7 +1220,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_catch_clause(self: *Self, c: *const ast.CatchClause) Error!void {
+    pub fn emit_catch_clause(self: *Self, c: *const ast.CatchClause) Error!void {
         try self.out.writeStr("catch");
         if (c.param != .null) {
             try self.out.space();
@@ -1232,7 +1232,7 @@ const Printer = struct {
         try self.emit(c.body);
     }
 
-    fn emit_variable_declaration(self: *Self, d: *const ast.VariableDeclaration) Error!void {
+    pub fn emit_variable_declaration(self: *Self, d: *const ast.VariableDeclaration) Error!void {
         if (self.options.strip) if (d.declare) return;
         try self.printVariableDecl(d.*, true, false);
     }
@@ -1253,7 +1253,7 @@ const Printer = struct {
         if (with_semicolon) try self.softSemi();
     }
 
-    fn emit_variable_declarator(self: *Self, d: *const ast.VariableDeclarator) Error!void {
+    pub fn emit_variable_declarator(self: *Self, d: *const ast.VariableDeclarator) Error!void {
         if (!self.options.strip) self.definite_pending = d.definite;
         try self.emit(d.id);
         std.debug.assert(!self.definite_pending);
@@ -1263,7 +1263,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_sequence_expression(
+    pub fn emit_sequence_expression(
         self: *Self,
         e: *const ast.SequenceExpression,
         ctx: Ctx,
@@ -1272,7 +1272,7 @@ const Printer = struct {
         try self.emitItems(self.tree.extra(e.expressions), .null, expression_ctx);
     }
 
-    fn emit_parenthesized_expression(
+    pub fn emit_parenthesized_expression(
         self: *Self,
         e: *const ast.ParenthesizedExpression,
     ) Error!void {
@@ -1291,7 +1291,7 @@ const Printer = struct {
         return if (mismatch) Precedence.Grouping else min;
     }
 
-    fn emit_conditional_expression(
+    pub fn emit_conditional_expression(
         self: *Self,
         e: *const ast.ConditionalExpression,
         ctx: Ctx,
@@ -1307,7 +1307,7 @@ const Printer = struct {
         try self.emitExpr(e.alternate, .{ .prec = Precedence.Assignment, .no_in = ctx.no_in });
     }
 
-    fn emit_unary_expression(self: *Self, e: *const ast.UnaryExpression, ctx: Ctx) Error!void {
+    pub fn emit_unary_expression(self: *Self, e: *const ast.UnaryExpression, ctx: Ctx) Error!void {
         const op = e.operator.toString();
         try self.out.writeStr(op);
         if (utils.isWordOp(op)) try self.out.writeByte(' ');
@@ -1317,7 +1317,7 @@ const Printer = struct {
         });
     }
 
-    fn emit_update_expression(self: *Self, e: *const ast.UpdateExpression) Error!void {
+    pub fn emit_update_expression(self: *Self, e: *const ast.UpdateExpression) Error!void {
         const op = e.operator.toString();
         if (e.prefix) {
             try self.out.writeStr(op);
@@ -1328,7 +1328,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_assignment_expression(
+    pub fn emit_assignment_expression(
         self: *Self,
         e: *const ast.AssignmentExpression,
         ctx: Ctx,
@@ -1364,7 +1364,7 @@ const Printer = struct {
         try self.emitExpr(idx, .{ .prec = Precedence.Assignment });
     }
 
-    fn emit_array_expression(self: *Self, e: *const ast.ArrayExpression) Error!void {
+    pub fn emit_array_expression(self: *Self, e: *const ast.ArrayExpression) Error!void {
         const in_target = self.in_assign_target;
         self.in_assign_target = false;
         defer self.in_assign_target = in_target;
@@ -1386,7 +1386,7 @@ const Printer = struct {
         try self.out.writeByte(']');
     }
 
-    fn emit_object_expression(self: *Self, e: *const ast.ObjectExpression) Error!void {
+    pub fn emit_object_expression(self: *Self, e: *const ast.ObjectExpression) Error!void {
         const in_target = self.in_assign_target;
         defer self.in_assign_target = in_target;
 
@@ -1406,7 +1406,7 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_object_property(self: *Self, p: *const ast.ObjectProperty) Error!void {
+    pub fn emit_object_property(self: *Self, p: *const ast.ObjectProperty) Error!void {
         if (p.method or p.kind == .get or p.kind == .set) {
             const fn_data = self.nodeData(p.value).function;
             switch (p.kind) {
@@ -1433,12 +1433,12 @@ const Printer = struct {
         try self.emitChildOfAssignTarget(p.value);
     }
 
-    fn emit_spread_element(self: *Self, s: *const ast.SpreadElement) Error!void {
+    pub fn emit_spread_element(self: *Self, s: *const ast.SpreadElement) Error!void {
         try self.out.writeStr("...");
         try self.emitValue(s.argument);
     }
 
-    fn emit_new_expression(self: *Self, e: *const ast.NewExpression) Error!void {
+    pub fn emit_new_expression(self: *Self, e: *const ast.NewExpression) Error!void {
         try self.out.writeStr("new ");
         try self.emitExpr(e.callee, .{
             .prec = Precedence.New,
@@ -1449,7 +1449,7 @@ const Printer = struct {
         try self.printArgList(e.arguments);
     }
 
-    fn emit_await_expression(self: *Self, e: *const ast.AwaitExpression, ctx: Ctx) Error!void {
+    pub fn emit_await_expression(self: *Self, e: *const ast.AwaitExpression, ctx: Ctx) Error!void {
         try self.out.writeStr("await ");
         try self.emitExpr(e.argument, .{
             .prec = Precedence.Unary,
@@ -1457,7 +1457,7 @@ const Printer = struct {
         });
     }
 
-    fn emit_yield_expression(self: *Self, e: *const ast.YieldExpression, ctx: Ctx) Error!void {
+    pub fn emit_yield_expression(self: *Self, e: *const ast.YieldExpression, ctx: Ctx) Error!void {
         try self.out.writeStr("yield");
         if (e.delegate) try self.out.writeByte('*');
         try self.emitRestrictedArg(e.argument, .{
@@ -1466,7 +1466,7 @@ const Printer = struct {
         });
     }
 
-    fn emit_meta_property(self: *Self, p: *const ast.MetaProperty) Error!void {
+    pub fn emit_meta_property(self: *Self, p: *const ast.MetaProperty) Error!void {
         try self.emit(p.meta);
         try self.out.writeByte('.');
         try self.emit(p.property);
@@ -1478,7 +1478,7 @@ const Printer = struct {
         try self.out.writeByte(')');
     }
 
-    fn emit_string_literal(self: *Self, lit: *const ast.StringLiteral) Error!void {
+    pub fn emit_string_literal(self: *Self, lit: *const ast.StringLiteral) Error!void {
         const raw = self.tree.string(lit.raw);
         const value = self.tree.string(lit.value);
         const q = self.pickQuote(value, raw.len != 0 and raw[0] == '\'');
@@ -1569,7 +1569,7 @@ const Printer = struct {
         try self.out.writeRawStr(&buf);
     }
 
-    fn emit_numeric_literal(self: *Self, lit: *const ast.NumericLiteral) Error!void {
+    pub fn emit_numeric_literal(self: *Self, lit: *const ast.NumericLiteral) Error!void {
         if (self.options.minify) return self.writeShortestNumber(lit.*);
         try self.writeNumber(self.tree.string(lit.raw));
     }
@@ -1596,12 +1596,12 @@ const Printer = struct {
         try self.writeNumber(utils.shortestDecimal(cleaned, &shortest_buf));
     }
 
-    fn emit_bigint_literal(self: *Self, lit: *const ast.BigIntLiteral) Error!void {
+    pub fn emit_bigint_literal(self: *Self, lit: *const ast.BigIntLiteral) Error!void {
         try self.writeString(lit.raw);
         try self.out.writeByte('n');
     }
 
-    fn emit_boolean_literal(self: *Self, lit: *const ast.BooleanLiteral) Error!void {
+    pub fn emit_boolean_literal(self: *Self, lit: *const ast.BooleanLiteral) Error!void {
         if (self.options.minify) {
             try self.out.writeStr(if (lit.value) "!0" else "!1");
         } else {
@@ -1609,14 +1609,14 @@ const Printer = struct {
         }
     }
 
-    fn emit_regexp_literal(self: *Self, lit: *const ast.RegExpLiteral) Error!void {
+    pub fn emit_regexp_literal(self: *Self, lit: *const ast.RegExpLiteral) Error!void {
         try self.out.writeByte('/');
         try self.out.writeRawStr(self.tree.string(lit.pattern));
         try self.out.writeRawByte('/');
         try self.out.writeRawStr(self.tree.string(lit.flags));
     }
 
-    fn emit_template_literal(self: *Self, lit: *const ast.TemplateLiteral, ctx: Ctx) Error!void {
+    pub fn emit_template_literal(self: *Self, lit: *const ast.TemplateLiteral, ctx: Ctx) Error!void {
         try self.printTemplate(lit.quasis, lit.expressions, ctx.tagged);
     }
 
@@ -1692,31 +1692,31 @@ const Printer = struct {
         if (start < raw.len) try self.out.writeRawStr(raw[start..]);
     }
 
-    fn emit_identifier_reference(self: *Self, id: *const ast.IdentifierReference) Error!void {
+    pub fn emit_identifier_reference(self: *Self, id: *const ast.IdentifierReference) Error!void {
         try self.writeString(id.name);
     }
 
-    fn emit_identifier_name(self: *Self, id: *const ast.IdentifierName) Error!void {
+    pub fn emit_identifier_name(self: *Self, id: *const ast.IdentifierName) Error!void {
         try self.writeString(id.name);
     }
 
-    fn emit_binding_identifier(self: *Self, id: *const ast.BindingIdentifier) Error!void {
+    pub fn emit_binding_identifier(self: *Self, id: *const ast.BindingIdentifier) Error!void {
         const definite = self.takeDefinite();
         if (!self.options.strip) try self.printDecorators(id.decorators);
         try self.writeString(id.name);
         try self.printBindingSuffix(id.optional, definite, id.type_annotation);
     }
 
-    fn emit_label_identifier(self: *Self, id: *const ast.LabelIdentifier) Error!void {
+    pub fn emit_label_identifier(self: *Self, id: *const ast.LabelIdentifier) Error!void {
         try self.writeString(id.name);
     }
 
-    fn emit_private_identifier(self: *Self, id: *const ast.PrivateIdentifier) Error!void {
+    pub fn emit_private_identifier(self: *Self, id: *const ast.PrivateIdentifier) Error!void {
         try self.out.writeByte('#');
         try self.writeString(id.name);
     }
 
-    fn emit_assignment_pattern(self: *Self, p: *const ast.AssignmentPattern) Error!void {
+    pub fn emit_assignment_pattern(self: *Self, p: *const ast.AssignmentPattern) Error!void {
         if (!self.options.strip) try self.printDecorators(p.decorators);
         try self.emit(p.left);
         if (!self.options.strip) if (p.optional) try self.out.writeByte('?');
@@ -1725,7 +1725,7 @@ const Printer = struct {
         try self.emitValue(p.right);
     }
 
-    fn emit_binding_rest_element(self: *Self, r: *const ast.BindingRestElement) Error!void {
+    pub fn emit_binding_rest_element(self: *Self, r: *const ast.BindingRestElement) Error!void {
         if (!self.options.strip) try self.printDecorators(r.decorators);
         try self.out.writeStr("...");
         try self.emit(r.argument);
@@ -1733,7 +1733,7 @@ const Printer = struct {
         try self.emit(r.type_annotation);
     }
 
-    fn emit_array_pattern(self: *Self, p: *const ast.ArrayPattern) Error!void {
+    pub fn emit_array_pattern(self: *Self, p: *const ast.ArrayPattern) Error!void {
         const definite = self.takeDefinite();
         if (!self.options.strip) try self.printDecorators(p.decorators);
         try self.out.writeByte('[');
@@ -1756,7 +1756,7 @@ const Printer = struct {
         try self.printBindingSuffix(p.optional, definite, p.type_annotation);
     }
 
-    fn emit_object_pattern(self: *Self, p: *const ast.ObjectPattern) Error!void {
+    pub fn emit_object_pattern(self: *Self, p: *const ast.ObjectPattern) Error!void {
         const definite = self.takeDefinite();
         if (!self.options.strip) try self.printDecorators(p.decorators);
         try self.out.writeByte('{');
@@ -1769,7 +1769,7 @@ const Printer = struct {
         try self.printBindingSuffix(p.optional, definite, p.type_annotation);
     }
 
-    fn emit_binding_property(self: *Self, p: *const ast.BindingProperty) Error!void {
+    pub fn emit_binding_property(self: *Self, p: *const ast.BindingProperty) Error!void {
         if (p.shorthand and shorthandStillValid(self.tree, p.key, p.value)) {
             try self.emitAssignTarget(p.value, .{});
             return;
@@ -1820,7 +1820,7 @@ const Printer = struct {
         try self.printPropertyKey(key, computed);
     }
 
-    fn emit_function(self: *Self, f: *const ast.Function) Error!void {
+    pub fn emit_function(self: *Self, f: *const ast.Function) Error!void {
         if (self.options.strip) {
             const is_ts_only = f.declare or
                 f.type == .ts_declare_function or
@@ -1850,7 +1850,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_arrow_function_expression(
+    pub fn emit_arrow_function_expression(
         self: *Self,
         a: *const ast.ArrowFunctionExpression,
         ctx: Ctx,
@@ -1902,7 +1902,7 @@ const Printer = struct {
         try self.closeList(depth);
     }
 
-    fn emit_class(self: *Self, c: *const ast.Class) Error!void {
+    pub fn emit_class(self: *Self, c: *const ast.Class) Error!void {
         if (self.options.strip) if (c.declare) return;
         try self.printDecorators(c.decorators);
         if (!self.options.strip) {
@@ -1933,7 +1933,7 @@ const Printer = struct {
         try self.emit(c.body);
     }
 
-    fn emit_class_body(self: *Self, b: *const ast.ClassBody) Error!void {
+    pub fn emit_class_body(self: *Self, b: *const ast.ClassBody) Error!void {
         try self.out.writeByte('{');
         self.indent_depth += 1;
         var any = false;
@@ -1957,7 +1957,7 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_method_definition(self: *Self, m: *const ast.MethodDefinition) Error!void {
+    pub fn emit_method_definition(self: *Self, m: *const ast.MethodDefinition) Error!void {
         const fn_data = self.nodeData(m.value).function;
         if (self.options.strip) if (m.abstract or fn_data.body == .null) return;
         try self.printDecorators(m.decorators);
@@ -1985,7 +1985,7 @@ const Printer = struct {
         try self.printFunctionAsMethod(fn_data);
     }
 
-    fn emit_property_definition(self: *Self, p: *const ast.PropertyDefinition) Error!void {
+    pub fn emit_property_definition(self: *Self, p: *const ast.PropertyDefinition) Error!void {
         if (self.options.strip) if (p.declare or p.abstract) return;
         try self.printDecorators(p.decorators);
         try self.hoistKeyComments(p.key);
@@ -2017,7 +2017,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_decorator(self: *Self, d: *const ast.Decorator) Error!void {
+    pub fn emit_decorator(self: *Self, d: *const ast.Decorator) Error!void {
         try self.out.writeByte('@');
         const simple = self.decoratorIsSimple(d.expression);
         try self.emitExpr(d.expression, .{
@@ -2054,7 +2054,7 @@ const Printer = struct {
         self.out.map_start = carry;
     }
 
-    fn emit_import_declaration(self: *Self, d: *const ast.ImportDeclaration) Error!void {
+    pub fn emit_import_declaration(self: *Self, d: *const ast.ImportDeclaration) Error!void {
         const list = self.tree.extra(d.specifiers);
         if (self.options.strip) {
             if (d.import_kind == .type) return;
@@ -2099,7 +2099,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_import_specifier(self: *Self, s: *const ast.ImportSpecifier) Error!void {
+    pub fn emit_import_specifier(self: *Self, s: *const ast.ImportSpecifier) Error!void {
         if (self.options.strip) if (s.import_kind == .type) return;
         if (s.import_kind == .type) try self.out.writeStr("type ");
         try self.emit(s.imported);
@@ -2109,11 +2109,11 @@ const Printer = struct {
         }
     }
 
-    fn emit_import_default_specifier(self: *Self, s: *const ast.ImportDefaultSpecifier) Error!void {
+    pub fn emit_import_default_specifier(self: *Self, s: *const ast.ImportDefaultSpecifier) Error!void {
         try self.emit(s.local);
     }
 
-    fn emit_import_namespace_specifier(
+    pub fn emit_import_namespace_specifier(
         self: *Self,
         s: *const ast.ImportNamespaceSpecifier,
     ) Error!void {
@@ -2121,14 +2121,14 @@ const Printer = struct {
         try self.emit(s.local);
     }
 
-    fn emit_import_attribute(self: *Self, a: *const ast.ImportAttribute) Error!void {
+    pub fn emit_import_attribute(self: *Self, a: *const ast.ImportAttribute) Error!void {
         try self.emit(a.key);
         try self.out.writeByte(':');
         try self.out.space();
         try self.emit(a.value);
     }
 
-    fn emit_import_expression(self: *Self, e: *const ast.ImportExpression) Error!void {
+    pub fn emit_import_expression(self: *Self, e: *const ast.ImportExpression) Error!void {
         try self.out.writeStr("import");
         if (e.phase) |ph| {
             try self.out.writeByte('.');
@@ -2144,7 +2144,7 @@ const Printer = struct {
         try self.out.writeByte(')');
     }
 
-    fn emit_export_named_declaration(
+    pub fn emit_export_named_declaration(
         self: *Self,
         d: *const ast.ExportNamedDeclaration,
     ) Error!void {
@@ -2181,7 +2181,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_export_default_declaration(
+    pub fn emit_export_default_declaration(
         self: *Self,
         d: *const ast.ExportDefaultDeclaration,
     ) Error!void {
@@ -2198,7 +2198,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_export_all_declaration(self: *Self, d: *const ast.ExportAllDeclaration) Error!void {
+    pub fn emit_export_all_declaration(self: *Self, d: *const ast.ExportAllDeclaration) Error!void {
         if (self.options.strip) if (d.export_kind == .type) return;
         try self.out.writeStr("export");
         if (d.export_kind == .type) try self.out.writeStr(" type");
@@ -2213,7 +2213,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_export_specifier(self: *Self, s: *const ast.ExportSpecifier) Error!void {
+    pub fn emit_export_specifier(self: *Self, s: *const ast.ExportSpecifier) Error!void {
         if (self.options.strip) if (s.export_kind == .type) return;
         if (s.export_kind == .type) try self.out.writeStr("type ");
         try self.emit(s.local);
@@ -2234,30 +2234,30 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_ts_type_annotation(self: *Self, t: *const ast.TSTypeAnnotation) Error!void {
+    pub fn emit_ts_type_annotation(self: *Self, t: *const ast.TSTypeAnnotation) Error!void {
         try self.out.writeByte(':');
         try self.out.space();
         try self.emit(t.type_annotation);
     }
 
-    fn emit_ts_type_reference(self: *Self, t: *const ast.TSTypeReference) Error!void {
+    pub fn emit_ts_type_reference(self: *Self, t: *const ast.TSTypeReference) Error!void {
         try self.emit(t.type_name);
         try self.emit(t.type_arguments);
     }
 
-    fn emit_ts_qualified_name(self: *Self, q: *const ast.TSQualifiedName) Error!void {
+    pub fn emit_ts_qualified_name(self: *Self, q: *const ast.TSQualifiedName) Error!void {
         try self.emit(q.left);
         try self.out.writeByte('.');
         try self.emit(q.right);
     }
 
-    fn emit_ts_type_query(self: *Self, q: *const ast.TSTypeQuery) Error!void {
+    pub fn emit_ts_type_query(self: *Self, q: *const ast.TSTypeQuery) Error!void {
         try self.out.writeStr("typeof ");
         try self.emit(q.expr_name);
         try self.emit(q.type_arguments);
     }
 
-    fn emit_ts_import_type(self: *Self, t: *const ast.TSImportType) Error!void {
+    pub fn emit_ts_import_type(self: *Self, t: *const ast.TSImportType) Error!void {
         try self.out.writeStr("import(");
         try self.emit(t.source);
         if (t.options != .null) {
@@ -2273,7 +2273,7 @@ const Printer = struct {
         try self.emit(t.type_arguments);
     }
 
-    fn emit_ts_type_parameter(self: *Self, p: *const ast.TSTypeParameter) Error!void {
+    pub fn emit_ts_type_parameter(self: *Self, p: *const ast.TSTypeParameter) Error!void {
         if (p.@"const") try self.out.writeStr("const ");
         if (p.in) try self.out.writeStr("in ");
         if (p.out) try self.out.writeStr("out ");
@@ -2288,7 +2288,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_type_parameter_declaration(
+    pub fn emit_ts_type_parameter_declaration(
         self: *Self,
         d: *const ast.TSTypeParameterDeclaration,
         ctx: Ctx,
@@ -2304,7 +2304,7 @@ const Printer = struct {
         try self.out.writeByte('>');
     }
 
-    fn emit_ts_type_parameter_instantiation(
+    pub fn emit_ts_type_parameter_instantiation(
         self: *Self,
         d: *const ast.TSTypeParameterInstantiation,
     ) Error!void {
@@ -2313,7 +2313,7 @@ const Printer = struct {
         try self.out.writeByte('>');
     }
 
-    fn emit_ts_literal_type(self: *Self, t: *const ast.TSLiteralType) Error!void {
+    pub fn emit_ts_literal_type(self: *Self, t: *const ast.TSLiteralType) Error!void {
         // `!0` is no type
         switch (self.nodeData(t.literal)) {
             .boolean_literal => |b| try self.out.writeStr(if (b.value) "true" else "false"),
@@ -2321,7 +2321,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_template_literal_type(self: *Self, t: *const ast.TSTemplateLiteralType) Error!void {
+    pub fn emit_ts_template_literal_type(self: *Self, t: *const ast.TSTemplateLiteralType) Error!void {
         try self.printTemplate(t.quasis, t.types, false);
     }
 
@@ -2343,25 +2343,25 @@ const Printer = struct {
         };
     }
 
-    fn emit_ts_array_type(self: *Self, t: *const ast.TSArrayType) Error!void {
+    pub fn emit_ts_array_type(self: *Self, t: *const ast.TSArrayType) Error!void {
         try self.emitType(t.element_type, TPrec.primary);
         try self.out.writeStr("[]");
     }
 
-    fn emit_ts_indexed_access_type(self: *Self, t: *const ast.TSIndexedAccessType) Error!void {
+    pub fn emit_ts_indexed_access_type(self: *Self, t: *const ast.TSIndexedAccessType) Error!void {
         try self.emitType(t.object_type, TPrec.primary);
         try self.out.writeByte('[');
         try self.emit(t.index_type);
         try self.out.writeByte(']');
     }
 
-    fn emit_ts_tuple_type(self: *Self, t: *const ast.TSTupleType) Error!void {
+    pub fn emit_ts_tuple_type(self: *Self, t: *const ast.TSTupleType) Error!void {
         try self.out.writeByte('[');
         try self.emitList(t.element_types);
         try self.out.writeByte(']');
     }
 
-    fn emit_ts_named_tuple_member(self: *Self, m: *const ast.TSNamedTupleMember) Error!void {
+    pub fn emit_ts_named_tuple_member(self: *Self, m: *const ast.TSNamedTupleMember) Error!void {
         try self.emit(m.label);
         if (m.optional) try self.out.writeByte('?');
         try self.out.writeByte(':');
@@ -2369,21 +2369,21 @@ const Printer = struct {
         try self.emit(m.element_type);
     }
 
-    fn emit_ts_optional_type(self: *Self, t: *const ast.TSOptionalType) Error!void {
+    pub fn emit_ts_optional_type(self: *Self, t: *const ast.TSOptionalType) Error!void {
         try self.emitType(t.type_annotation, TPrec.primary);
         try self.out.writeByte('?');
     }
 
-    fn emit_ts_rest_type(self: *Self, t: *const ast.TSRestType) Error!void {
+    pub fn emit_ts_rest_type(self: *Self, t: *const ast.TSRestType) Error!void {
         try self.out.writeStr("...");
         try self.emit(t.type_annotation);
     }
 
-    fn emit_ts_jsdoc_nullable_type(self: *Self, t: *const ast.TSJSDocNullableType) Error!void {
+    pub fn emit_ts_jsdoc_nullable_type(self: *Self, t: *const ast.TSJSDocNullableType) Error!void {
         try self.printJSDocNullability('?', t.type_annotation, t.postfix);
     }
 
-    fn emit_ts_jsdoc_non_nullable_type(
+    pub fn emit_ts_jsdoc_non_nullable_type(
         self: *Self,
         t: *const ast.TSJSDocNonNullableType,
     ) Error!void {
@@ -2396,11 +2396,11 @@ const Printer = struct {
         if (postfix) try self.out.writeByte(marker);
     }
 
-    fn emit_ts_union_type(self: *Self, t: *const ast.TSUnionType) Error!void {
+    pub fn emit_ts_union_type(self: *Self, t: *const ast.TSUnionType) Error!void {
         try self.emitTypeList(t.types, '|');
     }
 
-    fn emit_ts_intersection_type(self: *Self, t: *const ast.TSIntersectionType) Error!void {
+    pub fn emit_ts_intersection_type(self: *Self, t: *const ast.TSIntersectionType) Error!void {
         try self.emitTypeList(t.types, '&');
     }
 
@@ -2422,7 +2422,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_conditional_type(self: *Self, t: *const ast.TSConditionalType) Error!void {
+    pub fn emit_ts_conditional_type(self: *Self, t: *const ast.TSConditionalType) Error!void {
         try self.emitType(t.check_type, TPrec.@"union");
         try self.out.writeStr(" extends ");
         try self.emitType(t.extends_type, TPrec.@"union");
@@ -2436,28 +2436,28 @@ const Printer = struct {
         try self.emit(t.false_type);
     }
 
-    fn emit_ts_infer_type(self: *Self, t: *const ast.TSInferType) Error!void {
+    pub fn emit_ts_infer_type(self: *Self, t: *const ast.TSInferType) Error!void {
         try self.out.writeStr("infer ");
         try self.emit(t.type_parameter);
     }
 
-    fn emit_ts_type_operator(self: *Self, t: *const ast.TSTypeOperator) Error!void {
+    pub fn emit_ts_type_operator(self: *Self, t: *const ast.TSTypeOperator) Error!void {
         try self.out.writeStr(t.operator.toString());
         try self.out.writeByte(' ');
         try self.emitType(t.type_annotation, TPrec.operator);
     }
 
-    fn emit_ts_parenthesized_type(self: *Self, t: *const ast.TSParenthesizedType) Error!void {
+    pub fn emit_ts_parenthesized_type(self: *Self, t: *const ast.TSParenthesizedType) Error!void {
         try self.out.writeByte('(');
         try self.emit(t.type_annotation);
         try self.out.writeByte(')');
     }
 
-    fn emit_ts_function_type(self: *Self, t: *const ast.TSFunctionType) Error!void {
+    pub fn emit_ts_function_type(self: *Self, t: *const ast.TSFunctionType) Error!void {
         try self.printArrowType(t.type_parameters, t.params, t.return_type);
     }
 
-    fn emit_ts_constructor_type(self: *Self, t: *const ast.TSConstructorType) Error!void {
+    pub fn emit_ts_constructor_type(self: *Self, t: *const ast.TSConstructorType) Error!void {
         if (t.abstract) try self.out.writeStr("abstract ");
         try self.out.writeStr("new ");
         try self.printArrowType(t.type_parameters, t.params, t.return_type);
@@ -2485,7 +2485,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_type_predicate(self: *Self, t: *const ast.TSTypePredicate) Error!void {
+    pub fn emit_ts_type_predicate(self: *Self, t: *const ast.TSTypePredicate) Error!void {
         if (t.asserts) try self.out.writeStr("asserts ");
         try self.emit(t.parameter_name);
         if (t.type_annotation != .null) {
@@ -2494,11 +2494,11 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_type_literal(self: *Self, t: *const ast.TSTypeLiteral) Error!void {
+    pub fn emit_ts_type_literal(self: *Self, t: *const ast.TSTypeLiteral) Error!void {
         try self.printSignatureBody(t.members);
     }
 
-    fn emit_ts_mapped_type(self: *Self, t: *const ast.TSMappedType) Error!void {
+    pub fn emit_ts_mapped_type(self: *Self, t: *const ast.TSMappedType) Error!void {
         try self.out.writeByte('{');
         try self.out.space();
         try self.printMappedReadonly(t.readonly);
@@ -2542,7 +2542,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_property_signature(self: *Self, s: *const ast.TSPropertySignature) Error!void {
+    pub fn emit_ts_property_signature(self: *Self, s: *const ast.TSPropertySignature) Error!void {
         if (s.readonly) try self.out.writeStr("readonly ");
         try self.printPropertyKey(s.key, s.computed);
         if (s.optional) try self.out.writeByte('?');
@@ -2550,7 +2550,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_ts_method_signature(self: *Self, s: *const ast.TSMethodSignature) Error!void {
+    pub fn emit_ts_method_signature(self: *Self, s: *const ast.TSMethodSignature) Error!void {
         switch (s.kind) {
             .get => try self.out.writeStr("get "),
             .set => try self.out.writeStr("set "),
@@ -2573,14 +2573,14 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_ts_call_signature_declaration(
+    pub fn emit_ts_call_signature_declaration(
         self: *Self,
         s: *const ast.TSCallSignatureDeclaration,
     ) Error!void {
         try self.printSignatureTail(s.type_parameters, s.params, s.return_type);
     }
 
-    fn emit_ts_construct_signature_declaration(
+    pub fn emit_ts_construct_signature_declaration(
         self: *Self,
         s: *const ast.TSConstructSignatureDeclaration,
     ) Error!void {
@@ -2588,7 +2588,7 @@ const Printer = struct {
         try self.printSignatureTail(s.type_parameters, s.params, s.return_type);
     }
 
-    fn emit_ts_index_signature(self: *Self, s: *const ast.TSIndexSignature) Error!void {
+    pub fn emit_ts_index_signature(self: *Self, s: *const ast.TSIndexSignature) Error!void {
         if (s.static) try self.out.writeStr("static ");
         if (s.readonly) try self.out.writeStr("readonly ");
         try self.out.writeByte('[');
@@ -2614,7 +2614,7 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_ts_type_alias_declaration(
+    pub fn emit_ts_type_alias_declaration(
         self: *Self,
         d: *const ast.TSTypeAliasDeclaration,
     ) Error!void {
@@ -2656,7 +2656,7 @@ const Printer = struct {
         return if (list.len > 0) list[0] else null;
     }
 
-    fn emit_ts_interface_declaration(self: *Self, d: *const ast.TSInterfaceDeclaration) Error!void {
+    pub fn emit_ts_interface_declaration(self: *Self, d: *const ast.TSInterfaceDeclaration) Error!void {
         if (d.declare) try self.out.writeStr("declare ");
         try self.out.writeStr("interface ");
         try self.emit(d.id);
@@ -2669,21 +2669,21 @@ const Printer = struct {
         try self.emit(d.body);
     }
 
-    fn emit_ts_interface_body(self: *Self, b: *const ast.TSInterfaceBody) Error!void {
+    pub fn emit_ts_interface_body(self: *Self, b: *const ast.TSInterfaceBody) Error!void {
         try self.printSignatureBody(b.body);
     }
 
-    fn emit_ts_interface_heritage(self: *Self, h: *const ast.TSInterfaceHeritage) Error!void {
+    pub fn emit_ts_interface_heritage(self: *Self, h: *const ast.TSInterfaceHeritage) Error!void {
         try self.emit(h.expression);
         try self.emit(h.type_arguments);
     }
 
-    fn emit_ts_class_implements(self: *Self, c: *const ast.TSClassImplements) Error!void {
+    pub fn emit_ts_class_implements(self: *Self, c: *const ast.TSClassImplements) Error!void {
         try self.emit(c.expression);
         try self.emit(c.type_arguments);
     }
 
-    fn emit_ts_enum_declaration(self: *Self, d: *const ast.TSEnumDeclaration) Error!void {
+    pub fn emit_ts_enum_declaration(self: *Self, d: *const ast.TSEnumDeclaration) Error!void {
         if (d.declare) try self.out.writeStr("declare ");
         if (d.is_const) try self.out.writeStr("const ");
         try self.out.writeStr("enum ");
@@ -2692,7 +2692,7 @@ const Printer = struct {
         try self.emit(d.body);
     }
 
-    fn emit_ts_enum_body(self: *Self, b: *const ast.TSEnumBody) Error!void {
+    pub fn emit_ts_enum_body(self: *Self, b: *const ast.TSEnumBody) Error!void {
         try self.out.writeByte('{');
         const list = self.tree.extra(b.members);
         if (list.len > 0) {
@@ -2708,7 +2708,7 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_ts_enum_member(self: *Self, m: *const ast.TSEnumMember) Error!void {
+    pub fn emit_ts_enum_member(self: *Self, m: *const ast.TSEnumMember) Error!void {
         if (m.computed) {
             try self.out.writeByte('[');
             try self.emit(m.id);
@@ -2722,7 +2722,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_module_declaration(self: *Self, d: *const ast.TSModuleDeclaration) Error!void {
+    pub fn emit_ts_module_declaration(self: *Self, d: *const ast.TSModuleDeclaration) Error!void {
         if (d.declare) try self.out.writeStr("declare ");
         try self.out.writeStr(d.kind.toString());
         try self.out.writeByte(' ');
@@ -2735,18 +2735,18 @@ const Printer = struct {
         }
     }
 
-    fn emit_ts_module_block(self: *Self, b: *const ast.TSModuleBlock) Error!void {
+    pub fn emit_ts_module_block(self: *Self, b: *const ast.TSModuleBlock) Error!void {
         try self.printBlock(b.body, false);
     }
 
-    fn emit_ts_global_declaration(self: *Self, d: *const ast.TSGlobalDeclaration) Error!void {
+    pub fn emit_ts_global_declaration(self: *Self, d: *const ast.TSGlobalDeclaration) Error!void {
         if (d.declare) try self.out.writeStr("declare ");
         try self.emit(d.id);
         try self.out.space();
         try self.emit(d.body);
     }
 
-    fn emit_ts_type_assertion(self: *Self, e: *const ast.TSTypeAssertion, ctx: Ctx) Error!void {
+    pub fn emit_ts_type_assertion(self: *Self, e: *const ast.TSTypeAssertion, ctx: Ctx) Error!void {
         try self.out.writeByte('<');
         // `<<T>` would re-lex as `<<`
         if (typeStartsWithLeftAngle(self.tree, e.type_annotation)) try self.out.writeByte(' ');
@@ -2758,14 +2758,14 @@ const Printer = struct {
         });
     }
 
-    fn emit_ts_export_assignment(self: *Self, e: *const ast.TSExportAssignment) Error!void {
+    pub fn emit_ts_export_assignment(self: *Self, e: *const ast.TSExportAssignment) Error!void {
         try self.out.writeStr("export");
         try self.printEq();
         try self.emit(e.expression);
         try self.softSemi();
     }
 
-    fn emit_ts_namespace_export_declaration(
+    pub fn emit_ts_namespace_export_declaration(
         self: *Self,
         d: *const ast.TSNamespaceExportDeclaration,
     ) Error!void {
@@ -2774,7 +2774,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_ts_import_equals_declaration(
+    pub fn emit_ts_import_equals_declaration(
         self: *Self,
         d: *const ast.TSImportEqualsDeclaration,
     ) Error!void {
@@ -2786,7 +2786,7 @@ const Printer = struct {
         try self.softSemi();
     }
 
-    fn emit_ts_external_module_reference(
+    pub fn emit_ts_external_module_reference(
         self: *Self,
         r: *const ast.TSExternalModuleReference,
     ) Error!void {
@@ -2795,7 +2795,7 @@ const Printer = struct {
         try self.out.writeByte(')');
     }
 
-    fn emit_ts_parameter_property(self: *Self, p: *const ast.TSParameterProperty) Error!void {
+    pub fn emit_ts_parameter_property(self: *Self, p: *const ast.TSParameterProperty) Error!void {
         try self.printDecorators(p.decorators);
         if (p.accessibility != .none) {
             try self.out.writeStr(p.accessibility.toString());
@@ -2806,18 +2806,18 @@ const Printer = struct {
         try self.emit(p.parameter);
     }
 
-    fn emit_ts_this_parameter(self: *Self, p: *const ast.TSThisParameter) Error!void {
+    pub fn emit_ts_this_parameter(self: *Self, p: *const ast.TSThisParameter) Error!void {
         try self.out.writeStr("this");
         try self.emit(p.type_annotation);
     }
 
-    fn emit_jsx_element(self: *Self, e: *const ast.JSXElement) Error!void {
+    pub fn emit_jsx_element(self: *Self, e: *const ast.JSXElement) Error!void {
         try self.emit(e.opening_element);
         for (self.tree.extra(e.children)) |c| try self.emit(c);
         try self.emit(e.closing_element);
     }
 
-    fn emit_jsx_opening_element(self: *Self, o: *const ast.JSXOpeningElement) Error!void {
+    pub fn emit_jsx_opening_element(self: *Self, o: *const ast.JSXOpeningElement) Error!void {
         try self.out.writeByte('<');
         try self.emit(o.name);
         try self.emit(o.type_arguments);
@@ -2833,35 +2833,35 @@ const Printer = struct {
         }
     }
 
-    fn emit_jsx_closing_element(self: *Self, c: *const ast.JSXClosingElement) Error!void {
+    pub fn emit_jsx_closing_element(self: *Self, c: *const ast.JSXClosingElement) Error!void {
         try self.out.writeStr("</");
         try self.emit(c.name);
         try self.out.writeByte('>');
     }
 
-    fn emit_jsx_fragment(self: *Self, f: *const ast.JSXFragment) Error!void {
+    pub fn emit_jsx_fragment(self: *Self, f: *const ast.JSXFragment) Error!void {
         try self.emit(f.opening_fragment);
         for (self.tree.extra(f.children)) |c| try self.emit(c);
         try self.emit(f.closing_fragment);
     }
 
-    fn emit_jsx_identifier(self: *Self, id: *const ast.JSXIdentifier) Error!void {
+    pub fn emit_jsx_identifier(self: *Self, id: *const ast.JSXIdentifier) Error!void {
         try self.writeString(id.name);
     }
 
-    fn emit_jsx_namespaced_name(self: *Self, n: *const ast.JSXNamespacedName) Error!void {
+    pub fn emit_jsx_namespaced_name(self: *Self, n: *const ast.JSXNamespacedName) Error!void {
         try self.emit(n.namespace);
         try self.out.writeByte(':');
         try self.emit(n.name);
     }
 
-    fn emit_jsx_member_expression(self: *Self, m: *const ast.JSXMemberExpression) Error!void {
+    pub fn emit_jsx_member_expression(self: *Self, m: *const ast.JSXMemberExpression) Error!void {
         try self.emit(m.object);
         try self.out.writeByte('.');
         try self.emit(m.property);
     }
 
-    fn emit_jsx_attribute(self: *Self, a: *const ast.JSXAttribute) Error!void {
+    pub fn emit_jsx_attribute(self: *Self, a: *const ast.JSXAttribute) Error!void {
         try self.emit(a.name);
         if (a.value != .null) {
             try self.out.writeByte('=');
@@ -2873,7 +2873,7 @@ const Printer = struct {
         }
     }
 
-    fn emit_jsx_spread_attribute(self: *Self, a: *const ast.JSXSpreadAttribute) Error!void {
+    pub fn emit_jsx_spread_attribute(self: *Self, a: *const ast.JSXSpreadAttribute) Error!void {
         try self.printJSXSpread(a.argument);
     }
 
@@ -2883,19 +2883,19 @@ const Printer = struct {
         try self.out.writeByte('}');
     }
 
-    fn emit_jsx_expression_container(self: *Self, c: *const ast.JSXExpressionContainer) Error!void {
+    pub fn emit_jsx_expression_container(self: *Self, c: *const ast.JSXExpressionContainer) Error!void {
         try self.out.writeByte('{');
         try self.emitValue(c.expression);
         try self.out.writeByte('}');
     }
 
-    fn emit_jsx_empty_expression(_: *Self, _: *const ast.JSXEmptyExpression) Error!void {}
+    pub fn emit_jsx_empty_expression(_: *Self, _: *const ast.JSXEmptyExpression) Error!void {}
 
-    fn emit_jsx_text(self: *Self, t: *const ast.JSXText) Error!void {
+    pub fn emit_jsx_text(self: *Self, t: *const ast.JSXText) Error!void {
         try self.out.writeRawStr(self.tree.string(t.value));
     }
 
-    fn emit_jsx_spread_child(self: *Self, c: *const ast.JSXSpreadChild) Error!void {
+    pub fn emit_jsx_spread_child(self: *Self, c: *const ast.JSXSpreadChild) Error!void {
         try self.printJSXSpread(c.expression);
     }
 };

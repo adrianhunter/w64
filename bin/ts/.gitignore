@@ -1,0 +1,12 @@
+.direnv/
+.zig-cache/
+zig-out/
+.qjs-build/
+qjs-bundled.wasm
+node_modules/
+zig-pkg/
+qjs-deno.wasm
+qjs-blank.wasm
+qjs-bundled.opt.wasm
+qjs-deno.opt.wasm
+.qjs-cache/

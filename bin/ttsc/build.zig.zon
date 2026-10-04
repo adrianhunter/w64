@@ -32,6 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // The upstream snapshot `zig fetch --save` installed. The build uses
+        // `vendor/yuku` instead: the upstream build.zig still targets the
+        // Zig 0.16 std APIs, so the source is vendored and patched for 0.17.0.
         .yuku = .{
             .url = "git+https://github.com/yuku-toolchain/yuku.git#854e4cc8106671945c48f930718f0e099c608eaa",
             .hash = "yuku-0.17.0-m6rankCJEQDkYnK8o1sNKa5GlZ4NefrJe3oCuSzNvSem",
@@ -41,8 +44,8 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "vendor",
+        "test",
+        "README.md",
     },
 }

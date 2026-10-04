@@ -1,13 +1,13 @@
 const std = @import("std");
 
 // yuku 0.17.0 builds its parser module from `vendor/yuku`, a copy of the
-// fetched dependency patched for Zig 0.17.0 (the upstream build.zig still
-// targets Zig 0.16 std APIs). The dependency entry in build.zig.zon records
-// the exact upstream revision.
+// fetched dependency patched for Zig 0.17.0 (upstream still targets the
+// Zig 0.16 std APIs). The dependency entry in build.zig.zon records the
+// exact upstream revision.
 fn addYukuImports(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     parser_module: *std.Build.Module,
 ) void {
     const util_module = b.createModule(.{
@@ -24,9 +24,10 @@ fn addYukuImports(
 }
 
 pub fn build(b: *std.Build) void {
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
+    // `zig build` always emits the wasm32-freestanding bleeding-edge build,
+    // small and fast enough to run the recursive parser in a browser.
+    const optimize: std.builtin.Optimize = .small;
 
-    // `zig build` always produces the wasm32-freestanding bleeding-edge build.
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -51,6 +52,8 @@ pub fn build(b: *std.Build) void {
     const wasm = b.addExecutable(.{ .name = "ttsc", .root_module = wasm_module });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
+    // the parser and the transform recurse; give them room to work
+    wasm.stack_size = 16 * 1024 * 1024;
 
     // Write ttsc.wasm and ttsc-host.js next to the repository's bin directory.
     const update = b.addUpdateSourceFiles();
@@ -70,7 +73,7 @@ pub fn build(b: *std.Build) void {
     const tool_module = b.createModule(.{
         .root_source_file = b.path("src/tool.zig"),
         .target = host_target,
-        .optimize = optimize,
+        .optimize = .debug,
     });
     tool_module.addImport("parser", host_parser);
 

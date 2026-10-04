@@ -1,0 +1,53 @@
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+
+name: Test
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run unit tests
+        run: zig build test --release=small
+
+  deno:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install wizer
+        run: cargo install wizer --all-features
+      - run: npm ci
+      - name: Run Deno/Hono tests
+        run: node tools/test-deno.mjs
+
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Build examples
+        run: |
+          for dir in examples/*/; do
+            echo "Building $dir"
+            (cd "$dir" && zig build --release=small)
+          done

@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>ttsc minimal</title>
+<pre id="out">running…</pre>
+<script type="module">
+  try {
+    const ttsc = (await import("/bin/ttsc.wasm")).default;
+    const src = 'const x: number = 1;\nexport function App(props: { name: string }) { return <div class="a" onClick={() => console.log(props.name)}>Hello {props.name}</div>; }';
+    const out = ttsc(src, "index.tsx");
+    document.getElementById("out").textContent = "OK\n" + out;
+  } catch (e) {
+    document.getElementById("out").textContent = "ERR " + (e && e.stack ? e.stack : e);
+  }
+</script>

@@ -7,7 +7,7 @@ const transform = @import("transform.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa = init.gpa;
+    const gpa = std.heap.smp_allocator;
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
@@ -49,7 +49,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (tree.hasDiagnostics()) {
         for (tree.diagnostics.items) |d| {
-            std.debug.print("TREE DIAG: {s}\n", .{d.message});
+            const start = d.span.start;
+            const end = @min(d.span.end, final_src.len);
+            const lo = if (start > 80) start - 80 else 0;
+            const hi = @min(end + 40, final_src.len);
+            std.debug.print("TREE DIAG: {s} at {d}..{d}\n---\n{s}\n---\n", .{ d.message, start, end, final_src[lo..hi] });
         }
     }
     for (result.diagnostics) |d| {
