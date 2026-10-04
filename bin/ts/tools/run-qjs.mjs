@@ -36,15 +36,17 @@ function decode(ptr, len) {
 }
 
 // ---------------------------------------------------------------------------
-// Yuku transpiler worker
+// ttsc transpiler worker
 //
 // `qjs_host.transpile` is synchronous from the guest's point of view. The
-// actual transpilation runs on a worker_threads thread; the guest blocks on
-// an Atomics.wait until the worker posts the result back through a
-// SharedArrayBuffer.
+// actual transpilation runs on a worker_threads thread with bin/ttsc's
+// ttsc.wasm; the guest blocks on an Atomics.wait until the worker posts the
+// result back through a SharedArrayBuffer.
 // ---------------------------------------------------------------------------
 
 const YUKU_MAILBOX_BYTES = 32 * 1024 * 1024 + 8;
+const ttscWasmPath = process.env.QJS_TTSC ??
+  path.resolve(import.meta.dirname, "..", "..", "ttsc.wasm");
 let yukuWorker = null;
 let yukuState = null;
 let yukuData = null;
@@ -54,9 +56,9 @@ function getYukuWorker() {
   const sab = new SharedArrayBuffer(YUKU_MAILBOX_BYTES);
   yukuState = new Int32Array(sab, 0, 2);
   yukuData = new Uint8Array(sab, 8);
-  yukuWorker = new Worker(new URL("./yuku-worker.mjs", import.meta.url));
+  yukuWorker = new Worker(new URL("./ttsc-worker.mjs", import.meta.url));
   yukuWorker.unref();
-  yukuWorker.postMessage({ type: "init", sab });
+  yukuWorker.postMessage({ type: "init", sab, wasm: ttscWasmPath });
 }
 
 function transpileWithYuku(

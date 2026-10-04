@@ -113,10 +113,10 @@ const host = struct {
     /// until the next pending timer instead of spinning on the virtual clock.
     extern "qjs_host" fn timer_wait(ms: i64) void;
 
-    /// Transpiles `src` on a host worker thread. `mode` is either "strip"
-    /// (compact Yuku output) or "blank" (position-preserving erasure like
-    /// ts-blank-space). On success returns the number of bytes written to
-    /// `out`; on failure returns a negative value.
+    /// Transpiles `src` on a host worker thread with bin/ttsc's ttsc.wasm.
+    /// `mode` is kept for compatibility (ttsc ignores it). On success returns
+    /// the number of bytes written to `out`; on failure returns a negative
+    /// value.
     extern "qjs_host" fn transpile(
         src_ptr: [*]const u8,
         src_len: usize,
@@ -828,7 +828,7 @@ fn jsYukuTranspile(
     return Value.initStringLen(ctx, out[0..@intCast(n)]);
 }
 
-fn yukuModuleInit(ctx: *quickjs.Context, m: *quickjs.ModuleDef) bool {
+fn ttscModuleInit(ctx: *quickjs.Context, m: *quickjs.ModuleDef) bool {
     if (!m.setExport(
         ctx,
         "transpile",
@@ -837,8 +837,8 @@ fn yukuModuleInit(ctx: *quickjs.Context, m: *quickjs.ModuleDef) bool {
     return true;
 }
 
-fn yukuModule(ctx: *quickjs.Context) ?*quickjs.ModuleDef {
-    const m = quickjs.ModuleDef.init(ctx, "qjs:yuku", yukuModuleInit) orelse
+fn ttscModule(ctx: *quickjs.Context) ?*quickjs.ModuleDef {
+    const m = quickjs.ModuleDef.init(ctx, "qjs:ttsc", ttscModuleInit) orelse
         return null;
     _ = m.addExport(ctx, "transpile");
     return m;
@@ -853,7 +853,7 @@ fn moduleLoader(
     if (eql(name, "qjs:os")) return osModule(ctx);
     if (eql(name, "qjs:bjson")) return bjsonModule(ctx);
     if (eql(name, "qjs:web-globals")) return webGlobalsModule(ctx);
-    if (eql(name, "qjs:yuku")) return yukuModule(ctx);
+    if (eql(name, "qjs:ttsc") or eql(name, "qjs:yuku")) return ttscModule(ctx);
     if (eql(name, "node:sqlite") or eql(name, "sqlite")) {
         return sqlite_api.module(ctx, name);
     }
@@ -1147,10 +1147,8 @@ fn tsLangForPath(path: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Writes a single-file bundle without esbuild. TypeScript is erased with the
-/// blank-space technique (type syntax becomes whitespace), so every remaining
-/// byte keeps its original line and column and runtime errors point straight
-/// at the source file.
+/// Writes a single-file bundle without esbuild. TypeScript is erased by
+/// bin/ttsc's ttsc.wasm (qjs:ttsc / qjs_host.transpile).
 fn tryDirectBundle(
     gpa: std.mem.Allocator,
     io: Io,
@@ -1180,8 +1178,8 @@ fn tryDirectBundle(
             source.len,
             lang.ptr,
             lang.len,
-            "blank".ptr,
-            "blank".len,
+            "strip".ptr,
+            "strip".len,
             out.ptr,
             out.len,
         );
@@ -1300,13 +1298,13 @@ fn cmdBuild(init: std.process.Init, args: []const [:0]const u8) !void {
     if (specifiers.items.len == 0 and direct_lang != null) {
         const lang = direct_lang.?;
         printStdout(
-            "stripping {s} ({s}, blank space: positions preserved)...\n",
+            "stripping {s} ({s}) with ttsc...\n",
             .{ input_path, lang },
         );
         var direct_ok = true;
         tryDirectBundle(gpa, io, cwd, input_path, source, workdir, lang) catch |err| {
             printStderr(
-                "qjs build: blank-space stripping failed ({t}); " ++
+                "qjs build: ttsc stripping failed ({t}); " ++
                     "falling back to esbuild\n",
                 .{err},
             );

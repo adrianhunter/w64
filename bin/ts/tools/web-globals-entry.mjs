@@ -13,6 +13,29 @@ import {
 
 const g = globalThis;
 
+// QuickJS-ng ships a minimal `performance` object; the Node polyfills expect
+// the full Performance interface (methods live on the object, not a
+// prototype).
+if (g.performance) {
+  const perf = g.performance;
+  const fill = (name, value) => {
+    if (typeof perf[name] !== "function") perf[name] = value;
+  };
+  fill("now", () => Date.now());
+  fill("mark", () => {});
+  fill("measure", () => {});
+  fill("clearMarks", () => {});
+  fill("clearMeasures", () => {});
+  fill("clearResourceTimings", () => {});
+  fill("getEntries", () => []);
+  fill("getEntriesByName", () => []);
+  fill("getEntriesByType", () => []);
+  fill("markResourceTiming", () => {});
+  if (typeof perf.timeOrigin !== "number") {
+    perf.timeOrigin = Date.now();
+  }
+}
+
 if (typeof g.ReadableStream === "undefined") g.ReadableStream = ReadableStream;
 if (typeof g.WritableStream === "undefined") g.WritableStream = WritableStream;
 if (typeof g.TransformStream === "undefined") g.TransformStream = TransformStream;
