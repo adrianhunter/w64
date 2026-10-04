@@ -2,3 +2,12 @@
 zig-out/
 zig-pkg/
 *.o
+node_modules
+
+static
+
+Nodepod
+
+dist
+
+STEP.md

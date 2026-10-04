@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "target": "esnext",
+    "types": [],
+    "paths": {
+      "*": [
+        "./bin/*.ts"
+      ],
+      "node:*": [
+        "./bin/node/polyfills/*.ts"
+      ]
+    },
+    "noEmit": true,
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "rewriteRelativeImportExtensions": true,
+    "strict": true,
+    "jsx": "react-jsx",
+    "outDir": "${configDir}/dist",
+    "erasableSyntaxOnly": true,
+    "rootDir": "${configDir}/.",
+    "tsBuildInfoFile": "${configDir}/dist/.tsbuildinfo",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+  },
+  "exclude": [
+    "node_modules",
+    "Nodepod",
+  ],
+}

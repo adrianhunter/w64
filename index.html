@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>w64</title>
+        <script>
+        globalThis.esmsInitOptions = {
+            // Enable Shim Mode
+            shimMode: true, // default false
+            // Enable newer modules features
+            //   polyfillEnable: ['wasm-module-sources'], // default empty
+            // Disable features that are unused
+            //   polyfillDisable: ['css-modules'], // default empty
+            // Custom CSP nonce
+
+            polyfillEnable: ["all"],
+            //   nonce: 'n0nce', // default is automatic detection
+            // Don't retrigger load events on module scripts (DOMContentLoaded, domready, window 'onload')
+            noLoadEventRetriggers: true, // default false
+            // Skip source analysis of certain URLs for full native passthrough
+            //   skip: /^https:\/\/cdn\.com/, // defaults to null
+            // Secure mode to not support loading modules without integrity
+            // (integrity is always verified even when disabled though)
+            enforceIntegrity: false, // default false
+            // Permit overrides to import maps
+            mapOverrides: true, // default false
+            // Whether es-module-shims will defer to the native module loader whenever it can
+            // Automatically disabled in hot reloading workflows
+            //   nativePassthrough: false, // default true
+
+            // -- Hooks --
+            // Module load error
+            //   onerror: (e) => { /*...*/ }, // default noop
+            //   // Called when polyfill mode first engages
+            //   onpolyfill: () => {}, // default logs to the console
+            //   // Hook all module resolutions
+            //   resolve: (id, parentUrl, resolve) => resolve(id, parentUrl), // default is spec resolution
+            //   // Hook module source loading
+            //   source: (url, options, parentUrl, defaultSourceHook) => ({ type: 'js', source: 'export var p = 5' }),
+            //   // Hook source fetch function
+            //   fetch: (url, options) => fetch(url, options), // default is native
+            //   // Hook import.meta construction
+            //   meta: (meta, url) => void // default is noop
+            // Hook top-level imports
+            //   onimport: (url, options, parentUrl, source) => void // default is noop
+            //   // Ensure only the exact provided version of es-module-shims registered
+            //   version: '2.4.0' // default is empty
+        };
+
+        // import("./static/es-module-shims/dist/es-module-shims.debug.js").then(() => {
+        //     //   import("./server.ts").then((module) => {
+        //     //     const app = module.default;
+        //     //     serve(app.fetch);
+        //     //   });
+        // });
+        </script>
+
+        <script
+            async
+            src="/static/es-module-shims/dist/es-module-shims.debug.js"
+        ></script>
+
+        <script type="module-shim">
+          import './index.ts';
+        </script>
+    </head>
+    <body>
+        <h1>loading ...</h1>
+    </body>
+</html>

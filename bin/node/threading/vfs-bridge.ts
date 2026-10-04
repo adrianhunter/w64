@@ -1,0 +1,416 @@
+// syncs the canonical MemoryVolume with worker VFS clones
+// creates snapshots for init, applies worker writes, broadcasts changes
+
+import type { MemoryVolume } from "../memory-volume.ts";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths.ts";
+import type { VFSBinarySnapshot, VFSSnapshotEntry, WorkerToMain_VFSMeta } from "./worker-protocol.ts";
+import type { SharedVFSController } from "./shared-vfs.ts";
+
+const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+
+export class VFSBridge {
+  private _volume: MemoryVolume;
+  private _broadcaster: ((path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number) => void) | null = null;
+  private _sharedVFS: SharedVFSController | null = null;
+  // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
+  private _suppressWatch = false;
+  private _warnedSharedVFSDrop = false;
+  // called after a worker's bulk mount; used to page package packs back out
+  private _onWorkerSnapshot: ((snapshot: VFSBinarySnapshot) => void) | null = null;
+
+  constructor(volume: MemoryVolume) {
+    this._volume = volume;
+  }
+
+  setBroadcaster(fn: (path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number) => void): void {
+    this._broadcaster = fn;
+  }
+
+  // whether any process would receive a broadcast right now: with none (a
+  // process started later gets a snapshot), main-thread writes skip copying
+  // each changed file for nobody
+  private _hasBroadcastTargets: (() => boolean) | null = null;
+
+  setBroadcastTargets(fn: (() => boolean) | null): void {
+    this._hasBroadcastTargets = fn;
+  }
+
+  onWorkerSnapshot(fn: ((snapshot: VFSBinarySnapshot) => void) | null): void {
+    this._onWorkerSnapshot = fn;
+  }
+
+  setSharedVFS(controller: SharedVFSController, hydrate = false): void {
+    this._sharedVFS = controller;
+    if (hydrate) this._hydrateSharedVFS();
+  }
+
+  clearSharedVFS(): void {
+    this._sharedVFS = null;
+  }
+
+  private _hydrateSharedVFS(): void {
+    this._walkVolume("/", (path, isDirectory, content) => {
+      if (isDirectory) this._sharedVFSWriteDirectory(path);
+      else if (content) this._sharedVFSWrite(path, content);
+    });
+  }
+
+  // packs all files into one ArrayBuffer plus a manifest.
+  // excludeDirNames (lean spawn mode): directories with these names are
+  // recorded as empty dir entries but not descended into — the worker
+  // hydrates their contents lazily via the fs proxy.
+  createSnapshot(opts?: { excludeDirNames?: string[] }): VFSBinarySnapshot {
+    const manifest: VFSSnapshotEntry[] = [];
+    const chunks: Uint8Array[] = [];
+    const linkedContent = new Map<number, { offset: number; length: number }>();
+    let totalSize = 0;
+    const exclude =
+      opts?.excludeDirNames && opts.excludeDirNames.length > 0
+        ? new Set(opts.excludeDirNames)
+        : null;
+
+    this._walkVolume("/", (path, isDirectory, content, metadata) => {
+      if (isDirectory) {
+        manifest.push({
+          path,
+          offset: 0,
+          length: 0,
+          isDirectory: true,
+          ...metadata,
+        });
+      } else if (content || metadata?.symlinkTarget !== undefined) {
+        const linked = metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1
+          ? linkedContent.get(metadata.inode)
+          : undefined;
+        manifest.push({
+          path,
+          offset: linked?.offset ?? totalSize,
+          length: linked?.length ?? content?.byteLength ?? 0,
+          isDirectory: false,
+          ...metadata,
+        });
+        if (content && !linked) {
+          if (metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1) {
+            linkedContent.set(metadata.inode, { offset: totalSize, length: content.byteLength });
+          }
+          chunks.push(content);
+          totalSize += content.byteLength;
+        }
+      }
+    }, exclude);
+
+    const data = new ArrayBuffer(totalSize);
+    const view = new Uint8Array(data);
+    let offset = 0;
+    for (const chunk of chunks) {
+      view.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    const snapshot: VFSBinarySnapshot = { manifest, data };
+    if (exclude) snapshot.lazyDirNames = opts!.excludeDirNames!.slice();
+    return snapshot;
+  }
+
+  // split into chunks for large transfers
+  createChunkedSnapshots(): { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] {
+    // Build each output directly from the volume. Constructing one full
+    // snapshot first doubled the payload allocation at peak.
+    const pending: Array<{ data: ArrayBuffer; manifest: VFSSnapshotEntry[] }> = [];
+    let entries: VFSSnapshotEntry[] = [];
+    let dataParts: Uint8Array[] = [];
+    let chunkBytes = 0;
+    const linkedContent = new Map<number, { entries: VFSSnapshotEntry[]; offset: number; length: number }>();
+
+    const flush = (): void => {
+      if (entries.length === 0) return;
+      const data = new ArrayBuffer(chunkBytes);
+      const view = new Uint8Array(data);
+      let offset = 0;
+      for (const part of dataParts) {
+        view.set(part, offset);
+        offset += part.byteLength;
+      }
+      pending.push({ data, manifest: entries });
+      entries = [];
+      dataParts = [];
+      chunkBytes = 0;
+    };
+
+    this._walkVolume("/", (path, isDirectory, content, metadata) => {
+      if (isDirectory || metadata?.symlinkTarget !== undefined) {
+        entries.push({ path, offset: 0, length: 0, isDirectory, ...metadata });
+        return;
+      }
+      if (!content) return;
+      const linked = metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1
+        ? linkedContent.get(metadata.inode)
+        : undefined;
+      if (linked) {
+        // Keep all aliases in the chunk owning their payload. That also
+        // preserves hardlinks when chunks are mounted one at a time.
+        linked.entries.push({ path, offset: linked.offset, length: linked.length, isDirectory: false, ...metadata });
+        return;
+      }
+      if (chunkBytes > 0 && chunkBytes + content.byteLength > VFS_CHUNK_SIZE) flush();
+      entries.push({ path, offset: chunkBytes, length: content.byteLength, isDirectory: false, ...metadata });
+      if (metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1) {
+        linkedContent.set(metadata.inode, { entries, offset: chunkBytes, length: content.byteLength });
+      }
+      dataParts.push(content);
+      chunkBytes += content.byteLength;
+    });
+
+    flush();
+    if (pending.length === 0) pending.push({ data: new ArrayBuffer(0), manifest: [] });
+    return pending.map((chunk, chunkIndex) => ({
+      ...chunk,
+      chunkIndex,
+      totalChunks: pending.length,
+    }));
+  }
+
+  handleWorkerWrite(path: string, content: Uint8Array): void {
+    this._suppressWatch = true;
+    try {
+      const parentDir = path.substring(0, path.lastIndexOf("/")) || "/";
+      if (parentDir !== "/" && !this._volume.existsSync(parentDir)) {
+        this._volume.mkdirSync(parentDir, { recursive: true });
+      }
+      if (isInternalVfsPath(path)) {
+        this._volume.writeCacheSync(path, content);
+      } else {
+        this._volume.writeFileSync(path, content);
+      }
+      if (this._sharedVFS) {
+        this._sharedVFSWrite(path, content);
+      }
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
+  handleWorkerSnapshot(snapshot: VFSBinarySnapshot): void {
+    this._suppressWatch = true;
+    try {
+      this._volume.mountBinarySnapshot(snapshot, false);
+      if (this._sharedVFS) this._hydrateSharedVFS();
+    } finally {
+      this._suppressWatch = false;
+    }
+    this._onWorkerSnapshot?.(snapshot);
+  }
+
+  // writeFile returns false on table/data exhaustion — silent drops mean
+  // workers stop seeing updates, so surface it once per session
+  private _sharedVFSWrite(path: string, content: Uint8Array): void {
+    if (!this._sharedVFS!.writeFile(path, content)) {
+      this._warnSharedVFSDrop(path);
+    }
+  }
+
+  private _sharedVFSWriteDirectory(path: string): void {
+    if (!this._sharedVFS!.writeDirectory(path)) {
+      this._warnSharedVFSDrop(path);
+    }
+  }
+
+  private _warnSharedVFSDrop(path: string): void {
+    if (!this._warnedSharedVFSDrop) {
+      this._warnedSharedVFSDrop = true;
+      const stats = this._sharedVFS!.getStats();
+      console.warn(
+        `[VFSBridge] SharedVFS write dropped for "${path}" (entries: ${stats.entries}, data: ${stats.dataUsed}/${stats.bufferSize} bytes). ` +
+          `Workers may see stale reads. Further drops counted in getStats().droppedWrites.`,
+      );
+    }
+  }
+
+  handleWorkerMeta(meta: WorkerToMain_VFSMeta): void {
+    // metadata changes fire no watchers, so there's nothing to suppress
+    try {
+      if (!this._volume.inspectNode(meta.path)) return;
+      if (meta.mode !== undefined) this._volume.lchmodSync(meta.path, meta.mode);
+      if (meta.uid !== undefined && meta.gid !== undefined) {
+        this._volume.lchownSync(meta.path, meta.uid, meta.gid);
+      }
+      if (meta.atimeMs !== undefined && meta.mtimeMs !== undefined) {
+        this._volume.lutimesSync(meta.path, new Date(meta.atimeMs), new Date(meta.mtimeMs));
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Failed to apply metadata for "${meta.path}":`, e);
+    }
+  }
+
+  handleWorkerMkdir(path: string): void {
+    this._suppressWatch = true;
+    try {
+      if (!this._volume.existsSync(path)) {
+        this._volume.mkdirSync(path, { recursive: true });
+      }
+      if (this._sharedVFS) {
+        this._sharedVFSWriteDirectory(path);
+      }
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
+  handleWorkerDelete(path: string): void {
+    this._suppressWatch = true;
+    try {
+      try {
+        if (this._volume.existsSync(path)) {
+          const stat = this._volume.statSync(path);
+          if (stat.isDirectory()) {
+            // recursive delete matching Node's fs.rmSync({ recursive: true })
+            // workers may emit vfs-delete out of order (a rename's "from" fires before descendants are cleaned) or skip intermediate subdirs entirely — if the dir is still on main when a delete arrives, nuke it and everything under it
+            this._rmTree(path);
+          } else {
+            this._volume.unlinkSync(path);
+          }
+        }
+      } catch (e) {
+        console.warn(`[VFSBridge] Failed to delete "${path}":`, e);
+      }
+      if (this._sharedVFS) {
+        this._sharedVFS.deleteFile(path);
+      }
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
+  // recursively remove a directory tree, mirroring fs.rmSync({ recursive: true })
+  private _rmTree(path: string): void {
+    let entries: string[] = [];
+    try {
+      entries = this._volume.readdirSync(path);
+    } catch {
+      // path already gone, or not a directory
+    }
+    for (const name of entries) {
+      const child = path.endsWith("/") ? path + name : path + "/" + name;
+      try {
+        const childStat = this._volume.statSync(child);
+        if (childStat.isDirectory()) {
+          this._rmTree(child);
+        } else {
+          this._volume.unlinkSync(child);
+        }
+      } catch {
+        // ignore per-entry errors, still try to remove the parent
+      }
+    }
+    try {
+      this._volume.rmdirSync(path);
+    } catch (e) {
+      // only re-throw if the directory is still there, otherwise it's a benign race
+      if (this._volume.existsSync(path)) throw e;
+    }
+  }
+
+  broadcastChange(path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number): void {
+    if (isInternalVfsPath(path)) return;
+    if (this._broadcaster) {
+      this._broadcaster(path, content, isDirectory, excludePid);
+    }
+  }
+
+  // watch the canonical volume and push changes to workers, returns unsubscribe fn
+  watch(): () => void {
+    const handle = this._volume.watch("/", { recursive: true }, (event, filename) => {
+      if (!filename || this._suppressWatch) return;
+
+      // watch callbacks get filenames relative to the watch root, so
+      // writing /hello.txt while watching / comes through as "hello.txt".
+      // SharedVFS and broadcast keys are absolute, promote it here.
+      const absPath = filename.startsWith("/") ? filename : "/" + filename;
+      if (isInternalVfsPath(absPath)) return;
+      if (!this._sharedVFS && this._hasBroadcastTargets && !this._hasBroadcastTargets()) return;
+
+      // paged-out package content (memory.evictPackageContent): bring it
+      // back in, then broadcast it
+      if (this._volume.isPagedOut(absPath)) {
+        void this._volume
+          .ensureResident(absPath)
+          .then(() => this._broadcastPath(absPath))
+          .catch((e) => console.warn(`[VFSBridge] Watch error for "${absPath}":`, e));
+        return;
+      }
+      this._broadcastPath(absPath);
+    });
+
+    return () => handle.close();
+  }
+
+  private _broadcastPath(absPath: string): void {
+    try {
+      // existence and kind in one lookup, no stat object
+      const kind = this._volume.kindSync(absPath);
+      if (kind !== null) {
+        if (kind === "directory") {
+          this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
+          if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
+        } else {
+          // a copy for other threads, not a use: packed files stay packed
+          const data = this._volume.peekFileSync(absPath);
+          // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
+          const buffer = new ArrayBuffer(data.byteLength);
+          new Uint8Array(buffer).set(data);
+          this.broadcastChange(absPath, buffer, false, -1);
+          if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
+        }
+      } else {
+        this.broadcastChange(absPath, null, false, -1);
+        if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Watch error for "${absPath}":`, e);
+    }
+  }
+
+  private _walkVolume(
+    dir: string,
+    visitor: (path: string, isDirectory: boolean, content: Uint8Array | null, metadata?: Partial<VFSSnapshotEntry>) => void,
+    excludeDirNames?: Set<string> | null,
+  ): void {
+    try {
+      const entries = this._volume.readdirSync(dir);
+      for (const name of entries) {
+        const fullPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+        if (isInternalVfsPath(fullPath)) continue;
+        try {
+          const lstat = this._volume.lstatSync(fullPath);
+          if (lstat.isSymbolicLink()) {
+            visitor(fullPath, false, null, { symlinkTarget: this._volume.readlinkSync(fullPath) });
+            continue;
+          }
+          const stat = this._volume.statSync(fullPath);
+          const metadata = {
+            inode: stat.ino,
+            mode: stat.mode,
+            atimeMs: stat.atimeMs,
+            mtimeMs: stat.mtimeMs,
+            ctimeMs: stat.ctimeMs,
+            nlink: stat.nlink,
+          };
+          if (stat.isDirectory()) {
+            visitor(fullPath, true, null, metadata);
+            // record the dir itself but don't descend — worker fetches lazily
+            if (excludeDirNames?.has(name)) continue;
+            this._walkVolume(fullPath, visitor, excludeDirNames);
+          } else {
+            // a bulk copy: packed package files stay packed
+            const content = this._volume.peekFileSync(fullPath);
+            visitor(fullPath, false, content, metadata);
+          }
+        } catch (e) {
+          console.warn(`[VFSBridge] Failed to stat/read "${fullPath}":`, e);
+        }
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Failed to read directory "${dir}":`, e);
+    }
+  }
+}
